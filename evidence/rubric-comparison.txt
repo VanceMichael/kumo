@@ -1,0 +1,10 @@
+项目：sivchari-kumo-6ab4a38d-7108-4570-9a96-29df7bab7caa（project-01）
+Session：6aa9696385fd99219212e6ba｜有效轮数：131｜完成度：部分完成
+验证摘要：go test -count=1 ./... 通过；go test -race -count=3 . -run 'Test.*Multi|Test.*Server|Test.*Close' 通过；对抗复现确认 Close 返回后 S3 通知仍继续投递。
+Rubric ID：1｜状态：通过｜期望行为：两个 NewServer 的同名 SQS、S3 等资源保持实例隔离。｜实际观察：两个随机端口实例创建同名队列和桶后只能读取各自状态。｜直接证据：kumo_multi_instance_test.go:167 的隔离测试通过，service/registry.go:65-105 为每个 Server 构造独立服务图。
+Rubric ID：2｜状态：通过｜期望行为：本地事件只投递到所属 Server 的目标。｜实际观察：SNS→SQS、S3→SQS/SNS 和 CloudWatch→SNS 的事件均留在创建资源的实例。｜直接证据：kumo_multi_instance_test.go:264 的跨服务隔离测试在 race 三轮验证中通过。
+Rubric ID：3｜状态：通过｜期望行为：返回地址和内部目的地使用实例实际随机 URL。｜实际观察：QueueUrl 与 Lambda Location 分别带所属 srv.URL，客户端可直接访问。｜直接证据：kumo.go:46-85 先绑定 listener 再注入 BaseURL；kumo_multi_instance_test.go:167、473 的地址验证通过。
+Rubric ID：4｜状态：不通过｜期望行为：关闭一个 Server 收束其服务和后台任务且不影响另一实例，重复或并发 Close 安全。｜实际观察：阻塞 S3 publisher 后调用 Server.Close 立即返回，释放阻塞后通知 goroutine 继续完成投递。｜直接证据：internal/server/server.go:303-317 只逐项调用服务 Close，internal/service/s3/service.go 的 Close 不等待通知；对抗测试稳定观察到 Close 先返回、publisher 后完成。｜原因：Close 在已接纳的 S3 通知仍阻塞时返回，释放阻塞后该通知继续投递。｜影响：调用方无法把 Close 返回视为该实例跨服务工作已经收束，资源释放边界不成立。｜证据位置：internal/server/server.go:303-317、internal/service/s3/service.go 及 TestReviewerCloseWaitsForAcceptedS3Notification。
+Rubric ID：5｜状态：不通过｜期望行为：并发创建、使用和关闭不同 Server 时无共享竞态、串线或关闭后继续投递。｜实际观察：服务存储和 wiring 已实例化隔离，但 S3 fire-and-forget goroutine 不属于 Server 的等待或取消集合，关闭后仍调用实例 publisher。｜直接证据：对抗测试在通知阻塞期间完成 Close，随后解除 barrier 可观察 publisher 的 done 信号。｜原因：S3 通知 goroutine 未纳入 Server.Close 的等待或取消边界，关闭返回后仍能访问实例内 publisher。｜影响：并发测试在 teardown 返回后仍有异步副作用，后续用例可观察到迟到投递。｜证据位置：internal/service/s3/handlers.go 的异步通知入口、internal/server/server.go:303-317 及对抗测试日志。
+Rubric ID：6｜状态：通过｜期望行为：命令行默认 host/port、环境配置及 KUMO_DATA_DIR 重启恢复保持兼容。｜实际观察：DefaultConfig 保留默认 0.0.0.0:4566 并把 KUMO_DATA_DIR 传入每实例 factory，存储重载测试通过。｜直接证据：internal/server/server.go:41-60、133-141；internal/service/sqs 的 reload 测试和全量测试通过。
+Rubric ID：7｜状态：通过｜期望行为：单实例公开 URL、AWS 请求、跨服务通知和 Close 用法兼容且既有测试不回归。｜实际观察：公开 NewServer 用法与 AWS SDK 请求继续工作，仓库全量测试无回归。｜直接证据：go test -count=1 ./... 全部通过，kumo.go:25-102 保持 URL 与 Close 公共接口。

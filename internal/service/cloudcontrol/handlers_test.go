@@ -37,7 +37,7 @@ func TestCloudControl_TypeNotRegistered(t *testing.T) {
 }
 
 func TestCloudControl_DefaultRegistryRegistersBuiltinTypes(t *testing.T) {
-	reg := defaultRegistry()
+	reg := defaultRegistry(nil)
 
 	for _, want := range []string{
 		"AWS::S3::Bucket",

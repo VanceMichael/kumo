@@ -5,14 +5,15 @@ import (
 	"io"
 
 	"github.com/sivchari/kumo/internal/service"
-	"github.com/sivchari/kumo/internal/streams"
 )
 
 // Compile-time check that Service implements io.Closer.
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	service.Register(New(NewMemoryStorage(streams.Global)))
+	service.Register(func(d service.Deps) service.Service {
+		return New(NewMemoryStorage(d.Streams))
+	})
 }
 
 // Service implements the DynamoDB Streams service.

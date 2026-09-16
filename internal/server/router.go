@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"path"
 	"strings"
@@ -14,6 +15,23 @@ import (
 
 // localhostHost is the loopback host label used by kumo virtual-hosted URLs.
 const localhostHost = "localhost"
+
+// isLoopbackHost reports whether host is the localhost label or a
+// loopback IP literal. In-process test servers listen on a random
+// 127.0.0.1 port, so virtual-hosted forms like
+// `<bucket>.127.0.0.1` / `<api>.execute-api.127.0.0.1` must be treated
+// the same as the `...localhost` form.
+func isLoopbackHost(host string) bool {
+	if host == localhostHost {
+		return true
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+
+	return false
+}
 
 // Route represents a registered HTTP route.
 type Route struct {
@@ -322,7 +340,7 @@ func extractBucketFromHost(host string) string {
 	}
 
 	// Localhost / loopback IPs are never virtual-hosted.
-	if host == localhostHost || host == "127.0.0.1" {
+	if isLoopbackHost(host) {
 		return ""
 	}
 
@@ -342,7 +360,7 @@ func extractBucketFromHost(host string) string {
 	}
 
 	switch {
-	case rest == localhostHost:
+	case isLoopbackHost(rest):
 		return bucket
 	case rest == "s3.amazonaws.com":
 		return bucket

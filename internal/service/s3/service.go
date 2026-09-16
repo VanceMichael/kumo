@@ -41,8 +41,6 @@ type SNSPublisher interface {
 	Publish(ctx context.Context, topicARN, message, subject string) error
 }
 
-const defaultBaseURL = "http://localhost:4566"
-
 // snsNotificationSubject is the Subject AWS attaches to S3 event
 // notification messages published to SNS.
 const snsNotificationSubject = "Amazon S3 Notification"
@@ -51,18 +49,14 @@ const snsNotificationSubject = "Amazon S3 Notification"
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	baseURL := defaultBaseURL
+	service.Register(func(d service.Deps) service.Service {
+		var opts []Option
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	if port := os.Getenv("KUMO_PORT"); port != "" {
-		baseURL = fmt.Sprintf("http://localhost:%s", port)
-	}
-
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
-
-	service.Register(New(NewMemoryStorage(opts...), baseURL))
+		return New(NewMemoryStorage(opts...), d.BaseURL)
+	})
 }
 
 // Service implements the S3 service.

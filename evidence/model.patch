@@ -1,0 +1,4143 @@
+diff --git a/internal/server/router.go b/internal/server/router.go
+index 807698e..c5e6591 100644
+--- a/internal/server/router.go
++++ b/internal/server/router.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"io"
+ 	"log/slog"
++	"net"
+ 	"net/http"
+ 	"path"
+ 	"strings"
+@@ -15,6 +16,23 @@ import (
+ // localhostHost is the loopback host label used by kumo virtual-hosted URLs.
+ const localhostHost = "localhost"
+ 
++// isLoopbackHost reports whether host is the localhost label or a
++// loopback IP literal. In-process test servers listen on a random
++// 127.0.0.1 port, so virtual-hosted forms like
++// `<bucket>.127.0.0.1` / `<api>.execute-api.127.0.0.1` must be treated
++// the same as the `...localhost` form.
++func isLoopbackHost(host string) bool {
++	if host == localhostHost {
++		return true
++	}
++
++	if ip := net.ParseIP(host); ip != nil {
++		return ip.IsLoopback()
++	}
++
++	return false
++}
++
+ // Route represents a registered HTTP route.
+ type Route struct {
+ 	Method  string
+@@ -322,7 +340,7 @@ func extractBucketFromHost(host string) string {
+ 	}
+ 
+ 	// Localhost / loopback IPs are never virtual-hosted.
+-	if host == localhostHost || host == "127.0.0.1" {
++	if isLoopbackHost(host) {
+ 		return ""
+ 	}
+ 
+@@ -342,7 +360,7 @@ func extractBucketFromHost(host string) string {
+ 	}
+ 
+ 	switch {
+-	case rest == localhostHost:
++	case isLoopbackHost(rest):
+ 		return bucket
+ 	case rest == "s3.amazonaws.com":
+ 		return bucket
+diff --git a/internal/server/server.go b/internal/server/server.go
+index 6962c13..14740b5 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -14,11 +14,13 @@ import (
+ 	"os/signal"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+ 	"github.com/sivchari/kumo/internal/initdir"
+ 	"github.com/sivchari/kumo/internal/service"
++	"github.com/sivchari/kumo/internal/streams"
+ )
+ 
+ // Config holds the server configuration.
+@@ -27,6 +29,7 @@ type Config struct {
+ 	Port     int
+ 	LogLevel slog.Level
+ 	InitDir  string // Directory containing init scripts to execute on startup
++	DataDir  string // Snapshot directory; "" means the instance is ephemeral
+ }
+ 
+ // DefaultConfig returns the default server configuration.
+@@ -34,12 +37,14 @@ type Config struct {
+ // unparseable KUMO_PORT is ignored and the default port is kept.
+ // KUMO_LOG_LEVEL (debug|info|warn|error) overrides the default INFO level —
+ // useful when benchmarking, where per-request INFO logs dominate CPU.
++// KUMO_DATA_DIR enables snapshot persistence/restart.
+ func DefaultConfig() Config {
+ 	cfg := Config{
+ 		Host:     "0.0.0.0",
+ 		Port:     4566,
+ 		LogLevel: parseLogLevel(os.Getenv("KUMO_LOG_LEVEL"), slog.LevelInfo),
+ 		InitDir:  os.Getenv("KUMO_INIT_DIR"),
++		DataDir:  os.Getenv("KUMO_DATA_DIR"),
+ 	}
+ 
+ 	if host := os.Getenv("KUMO_HOST"); host != "" {
+@@ -55,6 +60,21 @@ func DefaultConfig() Config {
+ 	return cfg
+ }
+ 
++// BaseURL is the URL clients use to reach this server. Services embed it
++// in resource URLs (QueueUrl, function locations, ...) and use it for
++// loopback event delivery. Wildcard bind addresses (0.0.0.0/::) are
++// reported as localhost because a client can never dial them directly.
++func (c Config) BaseURL() string {
++	host := c.Host
++
++	switch host {
++	case "", "0.0.0.0", "::", "[::]":
++		host = "localhost"
++	}
++
++	return fmt.Sprintf("http://%s:%d", host, c.Port)
++}
++
+ func parseLogLevel(s string, def slog.Level) slog.Level {
+ 	switch strings.ToLower(s) {
+ 	case "debug":
+@@ -80,10 +100,15 @@ type Server struct {
+ 	cborDispatcher  *CBORProtocolDispatcher
+ 	logger          *slog.Logger
+ 	server          *http.Server
++	closeOnce       sync.Once
++	closeErr        error
+ }
+ 
+ // New creates a new server with the given configuration.
+-// Services registered via init() are automatically loaded.
++// Every registered service Factory is invoked for this server, so the
++// returned server owns an independent set of services, storage, routes,
++// cross-service wiring and background tasks: two Servers never share
++// state even when their resource names collide.
+ func New(config Config) *Server {
+ 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+ 		Level: config.LogLevel,
+@@ -105,8 +130,15 @@ func New(config Config) *Server {
+ 		logger:          logger,
+ 	}
+ 
+-	for _, svc := range service.Services() {
+-		srv.RegisterService(svc)
++	deps := service.Deps{
++		BaseURL: config.BaseURL(),
++		DataDir: config.DataDir,
++		Streams: streams.NewStore(),
++		Resolve: registry.Get,
++	}
++
++	for _, factory := range service.Factories() {
++		srv.RegisterService(factory(deps))
+ 	}
+ 
+ 	// Cross-service wiring (must happen after all services are registered).
+@@ -252,15 +284,34 @@ func (s *Server) Shutdown(ctx context.Context) error {
+ 		return fmt.Errorf("failed to shutdown server: %w", err)
+ 	}
+ 
+-	for _, svc := range s.registry.All() {
+-		if c, ok := svc.(io.Closer); ok {
+-			if err := c.Close(); err != nil {
+-				s.logger.Error("failed to save snapshot", "service", svc.Name(), "error", err)
++	return s.closeServices()
++}
++
++// Close releases this server instance's own background work and
++// persistent state without touching any other instance. It is used by
++// in-process servers whose HTTP listener is owned elsewhere (httptest).
++// Repeated and concurrent calls are safe and return the same result.
++func (s *Server) Close() error {
++	return s.closeServices()
++}
++
++// closeServices closes every service exactly once: each service stops
++// its own background tasks (async dispatchers, TTL reapers, delivery
++// goroutines) and flushes its own snapshot. Services belonging to other
++// server instances are never referenced.
++func (s *Server) closeServices() error {
++	s.closeOnce.Do(func() {
++		for _, svc := range s.registry.All() {
++			if c, ok := svc.(io.Closer); ok {
++				if err := c.Close(); err != nil {
++					s.logger.Error("failed to close service", "service", svc.Name(), "error", err)
++					s.closeErr = err
++				}
+ 			}
+ 		}
+-	}
++	})
+ 
+-	return nil
++	return s.closeErr
+ }
+ 
+ // Run starts the server and handles graceful shutdown.
+diff --git a/internal/service/acm/service.go b/internal/service/acm/service.go
+index 8af8a43..7c42c43 100644
+--- a/internal/service/acm/service.go
++++ b/internal/service/acm/service.go
+@@ -3,7 +3,6 @@ package acm
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the ACM service.
+diff --git a/internal/service/amp/service.go b/internal/service/amp/service.go
+index 42e6603..b66b249 100644
+--- a/internal/service/amp/service.go
++++ b/internal/service/amp/service.go
+@@ -21,12 +21,14 @@ const backendEnvVar = "KUMO_AMP_BACKEND"
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...), os.Getenv(backendEnvVar)))
++		return New(NewMemoryStorage(opts...), os.Getenv(backendEnvVar))
++	})
+ }
+ 
+ // Service implements the AMP service.
+diff --git a/internal/service/amplify/service.go b/internal/service/amplify/service.go
+index cefe995..5edeb57 100644
+--- a/internal/service/amplify/service.go
++++ b/internal/service/amplify/service.go
+@@ -3,7 +3,6 @@ package amplify
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the Amplify service.
+diff --git a/internal/service/apigateway/service.go b/internal/service/apigateway/service.go
+index 4471373..138603a 100644
+--- a/internal/service/apigateway/service.go
++++ b/internal/service/apigateway/service.go
+@@ -4,25 +4,25 @@ package apigateway
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+-	"github.com/sivchari/kumo/internal/service/execapi"
+ )
+ 
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	svc := New(NewMemoryStorage(opts...))
+-	svc.baseURL = execapi.ResolveBaseURL()
++		svc := New(NewMemoryStorage(opts...))
++		svc.baseURL = d.BaseURL
+ 
+-	service.Register(svc)
++		return svc
++	})
+ }
+ 
+ // Service implements the API Gateway service.
+diff --git a/internal/service/apigatewayv2/service.go b/internal/service/apigatewayv2/service.go
+index ef7e392..85c986c 100644
+--- a/internal/service/apigatewayv2/service.go
++++ b/internal/service/apigatewayv2/service.go
+@@ -4,10 +4,8 @@ package apigatewayv2
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+-	"github.com/sivchari/kumo/internal/service/execapi"
+ )
+ 
+ const (
+@@ -23,15 +21,17 @@ const (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	svc := New(NewMemoryStorage(opts...))
+-	svc.baseURL = execapi.ResolveBaseURL()
++		svc := New(NewMemoryStorage(opts...))
++		svc.baseURL = d.BaseURL
+ 
+-	service.Register(svc)
++		return svc
++	})
+ }
+ 
+ // Service implements the API Gateway v2 service.
+diff --git a/internal/service/appmesh/service.go b/internal/service/appmesh/service.go
+index 29054b4..2048f93 100644
+--- a/internal/service/appmesh/service.go
++++ b/internal/service/appmesh/service.go
+@@ -3,7 +3,6 @@ package appmesh
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -24,12 +23,14 @@ func New(storage Storage) *Service {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Name returns the service name.
+diff --git a/internal/service/appsync/service.go b/internal/service/appsync/service.go
+index 2c77ba3..c6019dd 100644
+--- a/internal/service/appsync/service.go
++++ b/internal/service/appsync/service.go
+@@ -3,7 +3,6 @@ package appsync
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the AppSync service.
+diff --git a/internal/service/athena/service.go b/internal/service/athena/service.go
+index 095dfb7..3a388d1 100644
+--- a/internal/service/athena/service.go
++++ b/internal/service/athena/service.go
+@@ -4,7 +4,6 @@ package athena
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Athena service.
+diff --git a/internal/service/backup/service.go b/internal/service/backup/service.go
+index a85049c..e4d726f 100644
+--- a/internal/service/backup/service.go
++++ b/internal/service/backup/service.go
+@@ -3,7 +3,6 @@ package backup
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the AWS Backup service.
+diff --git a/internal/service/batch/service.go b/internal/service/batch/service.go
+index 01941a3..c93d6ec 100644
+--- a/internal/service/batch/service.go
++++ b/internal/service/batch/service.go
+@@ -3,7 +3,6 @@ package batch
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Batch service.
+diff --git a/internal/service/ce/service.go b/internal/service/ce/service.go
+index c8afdea..781b1af 100644
+--- a/internal/service/ce/service.go
++++ b/internal/service/ce/service.go
+@@ -3,7 +3,6 @@ package ce
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,12 +14,14 @@ var _ service.Service = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the AWS Cost Explorer service.
+diff --git a/internal/service/cloudcontrol/aws_ec2_subnet.go b/internal/service/cloudcontrol/aws_ec2_subnet.go
+index 4e79a8f..7a20e9a 100644
+--- a/internal/service/cloudcontrol/aws_ec2_subnet.go
++++ b/internal/service/cloudcontrol/aws_ec2_subnet.go
+@@ -12,10 +12,14 @@ import (
+ // awsEC2Subnet adapts AWS::EC2::Subnet to the EC2 storage. Like
+ // awsEC2VPC, only the fields kumo's storage actually persists are
+ // honoured today; the rest can be added without changing the wire shape.
+-type awsEC2Subnet struct{}
++type awsEC2Subnet struct {
++	resolve serviceResolver
++}
+ 
+ func init() {
+-	registerDefaultHandler(&awsEC2Subnet{})
++	registerDefaultHandler(func(resolve serviceResolver) Handler {
++		return &awsEC2Subnet{resolve: resolve}
++	})
+ }
+ 
+ // subnetProperties is the JSON shape AWS::EC2::Subnet uses on the wire.
+@@ -29,8 +33,8 @@ type subnetProperties struct {
+ 
+ func (*awsEC2Subnet) TypeName() string { return "AWS::EC2::Subnet" }
+ 
+-func (*awsEC2Subnet) storage() (ec2.Storage, error) {
+-	return lookupStorage[ec2.Storage]("ec2")
++func (h *awsEC2Subnet) storage() (ec2.Storage, error) {
++	return lookupStorage[ec2.Storage](h.resolve, "ec2")
+ }
+ 
+ func (h *awsEC2Subnet) Create(ctx context.Context, desired []byte) (string, []byte, error) {
+diff --git a/internal/service/cloudcontrol/aws_ec2_vpc.go b/internal/service/cloudcontrol/aws_ec2_vpc.go
+index c678329..c3bb93d 100644
+--- a/internal/service/cloudcontrol/aws_ec2_vpc.go
++++ b/internal/service/cloudcontrol/aws_ec2_vpc.go
+@@ -12,10 +12,14 @@ import (
+ // awsEC2VPC adapts AWS::EC2::VPC to kumo's EC2 storage. Only the fields
+ // kumo's storage actually persists are honoured; other CFN properties can
+ // be wired through ModifyVpcAttribute later without changing the wire shape.
+-type awsEC2VPC struct{}
++type awsEC2VPC struct {
++	resolve serviceResolver
++}
+ 
+ func init() {
+-	registerDefaultHandler(&awsEC2VPC{})
++	registerDefaultHandler(func(resolve serviceResolver) Handler {
++		return &awsEC2VPC{resolve: resolve}
++	})
+ }
+ 
+ // vpcProperties is the JSON shape AWS::EC2::VPC uses on the wire.
+@@ -29,8 +33,8 @@ type vpcProperties struct {
+ 
+ func (*awsEC2VPC) TypeName() string { return "AWS::EC2::VPC" }
+ 
+-func (*awsEC2VPC) storage() (ec2.Storage, error) {
+-	return lookupStorage[ec2.Storage]("ec2")
++func (h *awsEC2VPC) storage() (ec2.Storage, error) {
++	return lookupStorage[ec2.Storage](h.resolve, "ec2")
+ }
+ 
+ func (h *awsEC2VPC) Create(ctx context.Context, desired []byte) (string, []byte, error) {
+diff --git a/internal/service/cloudcontrol/aws_iam_role.go b/internal/service/cloudcontrol/aws_iam_role.go
+index d71f3ef..9fe1f97 100644
+--- a/internal/service/cloudcontrol/aws_iam_role.go
++++ b/internal/service/cloudcontrol/aws_iam_role.go
+@@ -13,10 +13,14 @@ import (
+ // AssumeRolePolicyDocument arrives as either a JSON string or a structured
+ // object, but the IAM storage stores it as a string, so we re-marshal it
+ // on the way in and echo the stored string on the way out.
+-type awsIAMRole struct{}
++type awsIAMRole struct {
++	resolve serviceResolver
++}
+ 
+ func init() {
+-	registerDefaultHandler(&awsIAMRole{})
++	registerDefaultHandler(func(resolve serviceResolver) Handler {
++		return &awsIAMRole{resolve: resolve}
++	})
+ }
+ 
+ // roleProperties is the JSON shape AWS::IAM::Role uses on the wire. The
+@@ -34,8 +38,8 @@ type roleProperties struct {
+ 
+ func (*awsIAMRole) TypeName() string { return "AWS::IAM::Role" }
+ 
+-func (*awsIAMRole) storage() (iam.Storage, error) {
+-	return lookupStorage[iam.Storage]("iam")
++func (h *awsIAMRole) storage() (iam.Storage, error) {
++	return lookupStorage[iam.Storage](h.resolve, "iam")
+ }
+ 
+ func (h *awsIAMRole) Create(ctx context.Context, desired []byte) (string, []byte, error) {
+diff --git a/internal/service/cloudcontrol/aws_s3_bucket.go b/internal/service/cloudcontrol/aws_s3_bucket.go
+index ca413a6..65c7aeb 100644
+--- a/internal/service/cloudcontrol/aws_s3_bucket.go
++++ b/internal/service/cloudcontrol/aws_s3_bucket.go
+@@ -12,16 +12,20 @@ import (
+ // awsS3Bucket adapts AWS::S3::Bucket to kumo's S3 storage. The Properties
+ // payload is full-schema (null / empty defaults for what kumo doesn't
+ // model) so terraform-provider-awscc's "unknown after apply" plan resolves.
+-type awsS3Bucket struct{}
++type awsS3Bucket struct {
++	resolve serviceResolver
++}
+ 
+ func init() {
+-	registerDefaultHandler(&awsS3Bucket{})
++	registerDefaultHandler(func(resolve serviceResolver) Handler {
++		return &awsS3Bucket{resolve: resolve}
++	})
+ }
+ 
+ func (*awsS3Bucket) TypeName() string { return "AWS::S3::Bucket" }
+ 
+-func (*awsS3Bucket) s3Storage() (s3.Storage, error) {
+-	return lookupStorage[s3.Storage]("s3")
++func (h *awsS3Bucket) s3Storage() (s3.Storage, error) {
++	return lookupStorage[s3.Storage](h.resolve, "s3")
+ }
+ 
+ func (h *awsS3Bucket) Create(ctx context.Context, desiredState []byte) (string, []byte, error) {
+diff --git a/internal/service/cloudcontrol/handlers_test.go b/internal/service/cloudcontrol/handlers_test.go
+index 9c77f7d..ffaf5e7 100644
+--- a/internal/service/cloudcontrol/handlers_test.go
++++ b/internal/service/cloudcontrol/handlers_test.go
+@@ -37,7 +37,7 @@ func TestCloudControl_TypeNotRegistered(t *testing.T) {
+ }
+ 
+ func TestCloudControl_DefaultRegistryRegistersBuiltinTypes(t *testing.T) {
+-	reg := defaultRegistry()
++	reg := defaultRegistry(nil)
+ 
+ 	for _, want := range []string{
+ 		"AWS::S3::Bucket",
+diff --git a/internal/service/cloudcontrol/registry.go b/internal/service/cloudcontrol/registry.go
+index 8cd71aa..d031c57 100644
+--- a/internal/service/cloudcontrol/registry.go
++++ b/internal/service/cloudcontrol/registry.go
+@@ -77,24 +77,32 @@ func (r *Registry) Get(typeName string) (Handler, bool) {
+ 	return h, ok
+ }
+ 
+-// defaultHandlers collects the handlers registered via init() in
+-// per-resource files. It is appended to from those init() functions so
+-// every imported handler shows up in defaultRegistry().
+-var defaultHandlers []Handler
++// defaultHandlerFactories builds the built-in resource handlers bound to
++// one server instance's service resolver. Factories — rather than ready
++// handlers — are what per-resource init() functions register, so every
++// server instance gets handlers that resolve sibling services (s3, iam,
++// ec2, ...) within that instance only.
++var defaultHandlerFactories []func(serviceResolver) Handler
+ 
+ // registerDefaultHandler is the entry point per-resource init() functions
+-// use, e.g. `func init() { registerDefaultHandler(&S3Bucket{}) }`.
+-func registerDefaultHandler(h Handler) {
+-	defaultHandlers = append(defaultHandlers, h)
++// use, e.g.
++//
++//	func init() {
++//	    registerDefaultHandler(func(r serviceResolver) Handler {
++//	        return &awsS3Bucket{resolve: r}
++//	    })
++//	}
++func registerDefaultHandler(f func(serviceResolver) Handler) {
++	defaultHandlerFactories = append(defaultHandlerFactories, f)
+ }
+ 
+-// defaultRegistry builds a Registry populated with everything registered
+-// via registerDefaultHandler. Tests that want a focused registry can call
+-// NewRegistry() and Register() directly instead.
+-func defaultRegistry() *Registry {
++// defaultRegistry builds a Registry populated with every built-in
++// handler, each bound to resolve. Tests that want a focused registry can
++// call NewRegistry() and Register() directly instead.
++func defaultRegistry(resolve serviceResolver) *Registry {
+ 	r := NewRegistry()
+-	for _, h := range defaultHandlers {
+-		r.Register(h)
++	for _, f := range defaultHandlerFactories {
++		r.Register(f(resolve))
+ 	}
+ 
+ 	return r
+diff --git a/internal/service/cloudcontrol/service.go b/internal/service/cloudcontrol/service.go
+index 3c67c25..c1a1365 100644
+--- a/internal/service/cloudcontrol/service.go
++++ b/internal/service/cloudcontrol/service.go
+@@ -15,7 +15,9 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	service.Register(New(defaultRegistry()))
++	service.Register(func(d service.Deps) service.Service {
++		return New(defaultRegistry(serviceResolver(d.Resolve)))
++	})
+ }
+ 
+ // Service implements the Cloud Control API service. It dispatches each
+diff --git a/internal/service/cloudcontrol/storage_lookup.go b/internal/service/cloudcontrol/storage_lookup.go
+index 161e8ad..5a97fda 100644
+--- a/internal/service/cloudcontrol/storage_lookup.go
++++ b/internal/service/cloudcontrol/storage_lookup.go
+@@ -6,25 +6,32 @@ import (
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+ 
+-// lookupStorage finds the registered Service named serviceName and casts
+-// it to a type exposing `Storage() T`, letting resource handlers share the
+-// same in-memory store as the underlying service without coupling init()
+-// ordering between packages or knowing its concrete struct.
+-func lookupStorage[T any](serviceName string) (T, error) {
++// serviceResolver returns a sibling service of the same server instance
++// by name. A nil resolver represents a registry without access to other
++// services (e.g. focused unit tests).
++type serviceResolver func(name string) (service.Service, bool)
++
++// lookupStorage finds the Service named serviceName through the owning
++// server instance's resolver and casts it to a type exposing
++// `Storage() T`, letting resource handlers share the same in-memory store
++// as the underlying service of their own server instance — never another
++// concurrently running instance's store.
++func lookupStorage[T any](resolve serviceResolver, serviceName string) (T, error) {
+ 	var zero T
+ 
+-	for _, svc := range service.Services() {
+-		if svc.Name() != serviceName {
+-			continue
+-		}
++	if resolve == nil {
++		return zero, fmt.Errorf("%s service is not available in this registry", serviceName)
++	}
+ 
+-		provider, ok := svc.(interface{ Storage() T })
+-		if !ok {
+-			return zero, fmt.Errorf("%s service does not expose Storage() returning the expected type", serviceName)
+-		}
++	svc, ok := resolve(serviceName)
++	if !ok {
++		return zero, fmt.Errorf("%s service is not registered", serviceName)
++	}
+ 
+-		return provider.Storage(), nil
++	provider, ok := svc.(interface{ Storage() T })
++	if !ok {
++		return zero, fmt.Errorf("%s service does not expose Storage() returning the expected type", serviceName)
+ 	}
+ 
+-	return zero, fmt.Errorf("%s service is not registered", serviceName)
++	return provider.Storage(), nil
+ }
+diff --git a/internal/service/cloudformation/service.go b/internal/service/cloudformation/service.go
+index 0d18b05..09ee2e3 100644
+--- a/internal/service/cloudformation/service.go
++++ b/internal/service/cloudformation/service.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the CloudFormation service.
+diff --git a/internal/service/cloudfront/service.go b/internal/service/cloudfront/service.go
+index 913ec97..cb39ca3 100644
+--- a/internal/service/cloudfront/service.go
++++ b/internal/service/cloudfront/service.go
+@@ -3,7 +3,6 @@ package cloudfront
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the CloudFront service.
+diff --git a/internal/service/cloudtrail/service.go b/internal/service/cloudtrail/service.go
+index 5927897..71ecda9 100644
+--- a/internal/service/cloudtrail/service.go
++++ b/internal/service/cloudtrail/service.go
+@@ -4,7 +4,6 @@ package cloudtrail
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -44,12 +43,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/cloudwatch/service.go b/internal/service/cloudwatch/service.go
+index 3a2e466..b0409bb 100644
+--- a/internal/service/cloudwatch/service.go
++++ b/internal/service/cloudwatch/service.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/server"
+ 	"github.com/sivchari/kumo/internal/service"
+@@ -14,13 +13,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage("", opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage("", opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the CloudWatch service.
+diff --git a/internal/service/cloudwatchlogs/service.go b/internal/service/cloudwatchlogs/service.go
+index f56b679..5beb4a0 100644
+--- a/internal/service/cloudwatchlogs/service.go
++++ b/internal/service/cloudwatchlogs/service.go
+@@ -3,23 +3,22 @@ package cloudwatchlogs
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(defaultBaseURL, opts...), defaultBaseURL))
++		return New(NewMemoryStorage(d.BaseURL, opts...), d.BaseURL)
++	})
+ }
+ 
+ // Service implements the CloudWatch Logs service.
+diff --git a/internal/service/codeconnections/service.go b/internal/service/codeconnections/service.go
+index ed4a6fc..2dc1e30 100644
+--- a/internal/service/codeconnections/service.go
++++ b/internal/service/codeconnections/service.go
+@@ -3,7 +3,6 @@ package codeconnections
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -42,12 +41,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/codeguruprofiler/service.go b/internal/service/codeguruprofiler/service.go
+index 5686e03..10d762b 100644
+--- a/internal/service/codeguruprofiler/service.go
++++ b/internal/service/codeguruprofiler/service.go
+@@ -3,7 +3,6 @@ package codeguruprofiler
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the AWS CodeGuru Profiler service.
+diff --git a/internal/service/codegurureviewer/service.go b/internal/service/codegurureviewer/service.go
+index 3a41e87..a5527a8 100644
+--- a/internal/service/codegurureviewer/service.go
++++ b/internal/service/codegurureviewer/service.go
+@@ -3,7 +3,6 @@ package codegurureviewer
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the AWS CodeGuru Reviewer service.
+diff --git a/internal/service/cognito/service.go b/internal/service/cognito/service.go
+index 641f3e3..8e0428c 100644
+--- a/internal/service/cognito/service.go
++++ b/internal/service/cognito/service.go
+@@ -4,7 +4,6 @@ package cognito
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -42,12 +41,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/comprehend/service.go b/internal/service/comprehend/service.go
+index ed4f6ad..d2595ce 100644
+--- a/internal/service/comprehend/service.go
++++ b/internal/service/comprehend/service.go
+@@ -14,7 +14,9 @@ var (
+ )
+ 
+ func init() {
+-	service.Register(New())
++	service.Register(func(d service.Deps) service.Service {
++		return New()
++	})
+ }
+ 
+ // Service implements the AWS Comprehend service.
+diff --git a/internal/service/configservice/service.go b/internal/service/configservice/service.go
+index 310f208..ca4b5f2 100644
+--- a/internal/service/configservice/service.go
++++ b/internal/service/configservice/service.go
+@@ -4,7 +4,6 @@ package configservice
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -44,12 +43,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Ensure Service implements required interfaces.
+diff --git a/internal/service/dataexchange/service.go b/internal/service/dataexchange/service.go
+index 7078bef..46820a5 100644
+--- a/internal/service/dataexchange/service.go
++++ b/internal/service/dataexchange/service.go
+@@ -3,7 +3,6 @@ package dataexchange
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the AWS Data Exchange service.
+diff --git a/internal/service/dlm/service.go b/internal/service/dlm/service.go
+index 5df0d6f..f0444e8 100644
+--- a/internal/service/dlm/service.go
++++ b/internal/service/dlm/service.go
+@@ -4,7 +4,6 @@ package dlm
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the DLM service.
+diff --git a/internal/service/documentdb/service.go b/internal/service/documentdb/service.go
+index 45c3a84..100d7e7 100644
+--- a/internal/service/documentdb/service.go
++++ b/internal/service/documentdb/service.go
+@@ -3,7 +3,6 @@ package documentdb
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the DocumentDB service.
+diff --git a/internal/service/ds/service.go b/internal/service/ds/service.go
+index 337ae62..226d9e9 100644
+--- a/internal/service/ds/service.go
++++ b/internal/service/ds/service.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,16 +12,18 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	svc := &Service{
+-		storage: NewMemoryStorage(opts...),
+-	}
++		svc := &Service{
++			storage: NewMemoryStorage(opts...),
++		}
+ 
+-	service.Register(svc)
++		return svc
++	})
+ }
+ 
+ // Service implements the Directory Service.
+diff --git a/internal/service/dynamodb/service.go b/internal/service/dynamodb/service.go
+index a6a91c5..9424566 100644
+--- a/internal/service/dynamodb/service.go
++++ b/internal/service/dynamodb/service.go
+@@ -3,7 +3,6 @@ package dynamodb
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -11,15 +10,15 @@ import (
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		opts := []Option{WithStreamStore(d.Streams)}
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(defaultBaseURL, opts...)))
++		return New(NewMemoryStorage(d.BaseURL, opts...))
++	})
+ }
+ 
+ // Service implements the DynamoDB service.
+diff --git a/internal/service/dynamodb/storage.go b/internal/service/dynamodb/storage.go
+index 624ecff..35ee05b 100644
+--- a/internal/service/dynamodb/storage.go
++++ b/internal/service/dynamodb/storage.go
+@@ -71,6 +71,16 @@ func WithDataDir(dir string) Option {
+ 	}
+ }
+ 
++// WithStreamStore wires the storage to a specific DynamoDB streams store.
++// Each server instance passes its own store so its dynamodb and
++// dynamodbstreams services share streams within the instance but never
++// observe another instance's stream records.
++func WithStreamStore(store *streams.Store) Option {
++	return func(s *MemoryStorage) {
++		s.streamStore = store
++	}
++}
++
+ // Compile-time interface checks.
+ var (
+ 	_ json.Marshaler   = (*MemoryStorage)(nil)
+@@ -86,6 +96,7 @@ type MemoryStorage struct {
+ 	region      string
+ 	dataDir     string
+ 	stopTTL     chan struct{}
++	closeOnce   sync.Once
+ 	streamStore *streams.Store
+ }
+ 
+@@ -225,8 +236,16 @@ func (m *MemoryStorage) saveLocked() {
+ 	storage.ScheduleSave(m.dataDir, "dynamodb", m.MarshalJSON)
+ }
+ 
+-// Close saves the storage state to disk if persistence is enabled.
++// Close stops the background TTL reaper and, when persistence is
++// enabled, saves the storage state to disk. The reaper is stopped for
++// every instance — including ephemeral ones — so closing a server does
++// not leave a goroutine holding the storage alive. closeOnce makes
++// repeated or concurrent Close safe.
+ func (m *MemoryStorage) Close() error {
++	m.closeOnce.Do(func() {
++		close(m.stopTTL)
++	})
++
+ 	if m.dataDir == "" {
+ 		return nil
+ 	}
+diff --git a/internal/service/dynamodbstreams/service.go b/internal/service/dynamodbstreams/service.go
+index 28f32eb..697dc59 100644
+--- a/internal/service/dynamodbstreams/service.go
++++ b/internal/service/dynamodbstreams/service.go
+@@ -5,14 +5,15 @@ import (
+ 	"io"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+-	"github.com/sivchari/kumo/internal/streams"
+ )
+ 
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	service.Register(New(NewMemoryStorage(streams.Global)))
++	service.Register(func(d service.Deps) service.Service {
++		return New(NewMemoryStorage(d.Streams))
++	})
+ }
+ 
+ // Service implements the DynamoDB Streams service.
+diff --git a/internal/service/ebs/service.go b/internal/service/ebs/service.go
+index be8cdd7..67d2bb9 100644
+--- a/internal/service/ebs/service.go
++++ b/internal/service/ebs/service.go
+@@ -3,7 +3,6 @@ package ebs
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -50,12 +49,14 @@ func (s *Service) Close() error {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Meta returns the service's documentation metadata.
+diff --git a/internal/service/ec2/service.go b/internal/service/ec2/service.go
+index ebff4e7..992ff66 100644
+--- a/internal/service/ec2/service.go
++++ b/internal/service/ec2/service.go
+@@ -3,7 +3,6 @@ package ec2
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the EC2 service.
+diff --git a/internal/service/ecr/service.go b/internal/service/ecr/service.go
+index 2c04713..1f44313 100644
+--- a/internal/service/ecr/service.go
++++ b/internal/service/ecr/service.go
+@@ -4,7 +4,6 @@ package ecr
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -44,12 +43,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/ecs/service.go b/internal/service/ecs/service.go
+index fa770bd..aa259a7 100644
+--- a/internal/service/ecs/service.go
++++ b/internal/service/ecs/service.go
+@@ -3,7 +3,6 @@ package ecs
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the ECS service.
+diff --git a/internal/service/eks/service.go b/internal/service/eks/service.go
+index 6f1a7af..e8e307d 100644
+--- a/internal/service/eks/service.go
++++ b/internal/service/eks/service.go
+@@ -5,7 +5,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -14,12 +13,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the EKS service.
+diff --git a/internal/service/elasticache/service.go b/internal/service/elasticache/service.go
+index 1c7e201..300d2e5 100644
+--- a/internal/service/elasticache/service.go
++++ b/internal/service/elasticache/service.go
+@@ -3,7 +3,6 @@ package elasticache
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the ElastiCache service.
+diff --git a/internal/service/elasticbeanstalk/service.go b/internal/service/elasticbeanstalk/service.go
+index b517bd1..3a282e6 100644
+--- a/internal/service/elasticbeanstalk/service.go
++++ b/internal/service/elasticbeanstalk/service.go
+@@ -3,7 +3,6 @@ package elasticbeanstalk
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -71,12 +70,14 @@ func (s *Service) Close() error {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Meta returns the service's documentation metadata.
+diff --git a/internal/service/elbv2/service.go b/internal/service/elbv2/service.go
+index 0e9df2c..ed9f121 100644
+--- a/internal/service/elbv2/service.go
++++ b/internal/service/elbv2/service.go
+@@ -3,7 +3,6 @@ package elbv2
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the ELB v2 service.
+diff --git a/internal/service/emrserverless/service.go b/internal/service/emrserverless/service.go
+index dd00205..8719ea4 100644
+--- a/internal/service/emrserverless/service.go
++++ b/internal/service/emrserverless/service.go
+@@ -3,7 +3,6 @@ package emrserverless
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -24,12 +23,14 @@ func New(storage Storage) *Service {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/entityresolution/service.go b/internal/service/entityresolution/service.go
+index a166c94..2d0a30e 100644
+--- a/internal/service/entityresolution/service.go
++++ b/internal/service/entityresolution/service.go
+@@ -4,7 +4,6 @@ package entityresolution
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Entity Resolution service.
+diff --git a/internal/service/eventbridge/service.go b/internal/service/eventbridge/service.go
+index 688fc62..e3590ba 100644
+--- a/internal/service/eventbridge/service.go
++++ b/internal/service/eventbridge/service.go
+@@ -4,13 +4,10 @@ package eventbridge
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+@@ -44,28 +41,15 @@ func (s *Service) RegisterRoutes(r service.Router) {
+ }
+ 
+ func init() {
+-	baseURL := defaultBaseURL
++	service.Register(func(d service.Deps) service.Service {
++		opts := []Option{WithBaseURL(d.BaseURL)}
+ 
+-	if host := os.Getenv("KUMO_HOST"); host != "" {
+-		port := os.Getenv("KUMO_PORT")
+-		if port == "" {
+-			port = "4566"
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
+ 		}
+ 
+-		baseURL = fmt.Sprintf("http://%s:%s", host, port)
+-	} else if port := os.Getenv("KUMO_PORT"); port != "" {
+-		baseURL = fmt.Sprintf("http://localhost:%s", port)
+-	}
+-
+-	var opts []Option
+-
+-	opts = append(opts, WithBaseURL(baseURL))
+-
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
+-
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/execapi/baseurl.go b/internal/service/execapi/baseurl.go
+index 7600f91..961840e 100644
+--- a/internal/service/execapi/baseurl.go
++++ b/internal/service/execapi/baseurl.go
+@@ -1,30 +1,7 @@
+ package execapi
+ 
+-import (
+-	"fmt"
+-	"os"
+-)
+-
+-// DefaultBaseURL is the kumo server URL used for in-process self-calls
+-// (execute-api -> Lambda invoke) when KUMO_HOST/KUMO_PORT are not set.
++// DefaultBaseURL is the fallback kumo server URL for execute-api
++// self-calls when a service has not been configured with the URL of its
++// owning listener. Normally every service receives the owning server's
++// actual address through service.Deps.BaseURL at construction time.
+ const DefaultBaseURL = "http://localhost:4566"
+-
+-// ResolveBaseURL builds the kumo server base URL from KUMO_HOST / KUMO_PORT,
+-// mirroring the convention used by other services that self-call kumo
+-// endpoints (e.g. eventbridge -> lambda).
+-func ResolveBaseURL() string {
+-	if host := os.Getenv("KUMO_HOST"); host != "" {
+-		port := os.Getenv("KUMO_PORT")
+-		if port == "" {
+-			port = "4566"
+-		}
+-
+-		return fmt.Sprintf("http://%s:%s", host, port)
+-	}
+-
+-	if port := os.Getenv("KUMO_PORT"); port != "" {
+-		return fmt.Sprintf("http://localhost:%s", port)
+-	}
+-
+-	return DefaultBaseURL
+-}
+diff --git a/internal/service/finspace/service.go b/internal/service/finspace/service.go
+index 0a12990..86e3396 100644
+--- a/internal/service/finspace/service.go
++++ b/internal/service/finspace/service.go
+@@ -3,7 +3,6 @@ package finspace
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,12 +14,14 @@ var (
+ )
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the FinSpace service.
+diff --git a/internal/service/firehose/service.go b/internal/service/firehose/service.go
+index 75b2130..44c713a 100644
+--- a/internal/service/firehose/service.go
++++ b/internal/service/firehose/service.go
+@@ -4,7 +4,6 @@ package firehose
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -55,12 +54,14 @@ func (s *Service) Close() error {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Meta returns the service's documentation metadata.
+diff --git a/internal/service/forecast/service.go b/internal/service/forecast/service.go
+index ff232de..e4904bd 100644
+--- a/internal/service/forecast/service.go
++++ b/internal/service/forecast/service.go
+@@ -4,7 +4,6 @@ package forecast
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -47,12 +46,14 @@ func (s *Service) Close() error {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ var (
+diff --git a/internal/service/gamelift/service.go b/internal/service/gamelift/service.go
+index 4b47359..febfdca 100644
+--- a/internal/service/gamelift/service.go
++++ b/internal/service/gamelift/service.go
+@@ -4,7 +4,6 @@ package gamelift
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -52,12 +51,14 @@ func (s *Service) Close() error {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Ensure Service implements required interfaces.
+diff --git a/internal/service/glacier/service.go b/internal/service/glacier/service.go
+index ac51209..e0f9df4 100644
+--- a/internal/service/glacier/service.go
++++ b/internal/service/glacier/service.go
+@@ -3,7 +3,6 @@ package glacier
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -38,12 +37,14 @@ func (s *Service) RegisterRoutes(r service.Router) {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/globalaccelerator/service.go b/internal/service/globalaccelerator/service.go
+index 8fa29a8..d10832c 100644
+--- a/internal/service/globalaccelerator/service.go
++++ b/internal/service/globalaccelerator/service.go
+@@ -4,7 +4,6 @@ package globalaccelerator
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -42,12 +41,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/glue/service.go b/internal/service/glue/service.go
+index 4708e1b..b5e99a4 100644
+--- a/internal/service/glue/service.go
++++ b/internal/service/glue/service.go
+@@ -3,7 +3,6 @@ package glue
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Glue service.
+diff --git a/internal/service/iam/service.go b/internal/service/iam/service.go
+index ec5bc24..6118792 100644
+--- a/internal/service/iam/service.go
++++ b/internal/service/iam/service.go
+@@ -5,7 +5,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -18,12 +17,14 @@ var _ io.Closer = (*Service)(nil)
+ const serviceName = "iam"
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the IAM service.
+diff --git a/internal/service/kafka/service.go b/internal/service/kafka/service.go
+index ad5f820..809fe7d 100644
+--- a/internal/service/kafka/service.go
++++ b/internal/service/kafka/service.go
+@@ -5,7 +5,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+@@ -15,12 +14,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the MSK service.
+diff --git a/internal/service/kinesis/service.go b/internal/service/kinesis/service.go
+index 5994beb..9bda6c1 100644
+--- a/internal/service/kinesis/service.go
++++ b/internal/service/kinesis/service.go
+@@ -4,7 +4,6 @@ package kinesis
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -55,12 +54,14 @@ func (s *Service) Close() error {
+ }
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Meta returns the service's documentation metadata.
+diff --git a/internal/service/kms/service.go b/internal/service/kms/service.go
+index e7f107b..9a1b33d 100644
+--- a/internal/service/kms/service.go
++++ b/internal/service/kms/service.go
+@@ -3,7 +3,6 @@ package kms
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -42,12 +41,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/lambda/async.go b/internal/service/lambda/async.go
+index ef50434..1d1c438 100644
+--- a/internal/service/lambda/async.go
++++ b/internal/service/lambda/async.go
+@@ -52,9 +52,10 @@ type asyncEvent struct {
+ // Delivery is retried with exponential backoff, so a 202 from Invoke means
+ // "accepted for delivery" rather than "attempted once" (issue #803).
+ type asyncDispatcher struct {
+-	client *http.Client
+-	done   chan struct{}
+-	wg     sync.WaitGroup
++	client    *http.Client
++	done      chan struct{}
++	closeOnce sync.Once
++	wg        sync.WaitGroup
+ 
+ 	initialBackoff time.Duration
+ 	maxBackoff     time.Duration
+@@ -158,9 +159,14 @@ func (d *asyncDispatcher) enqueue(functionName string, deliverer asyncDeliverer,
+ }
+ 
+ // close stops all drain goroutines and waits for them to exit. In-flight
+-// requests are aborted through each drain goroutine's context.
++// requests are aborted through each drain goroutine's context. It is safe
++// to call repeatedly or concurrently: only the first call closes the
++// shutdown channel; every call waits for the drain goroutines to exit.
+ func (d *asyncDispatcher) close() {
+-	close(d.done)
++	d.closeOnce.Do(func() {
++		close(d.done)
++	})
++
+ 	d.wg.Wait()
+ }
+ 
+diff --git a/internal/service/lambda/async_test.go b/internal/service/lambda/async_test.go
+index ce6aa0c..782d6c0 100644
+--- a/internal/service/lambda/async_test.go
++++ b/internal/service/lambda/async_test.go
+@@ -521,8 +521,10 @@ func newInvokeTestService(t *testing.T, fn, endpoint string) *Service {
+ func newInvokeTestServiceMulti(t *testing.T, endpoints map[string]string) *Service {
+ 	t.Helper()
+ 
+-	storage := NewMemoryStorage(defaultBaseURL)
+-	svc := New(storage, defaultBaseURL)
++	const testBaseURL = "http://localhost:4566"
++
++	storage := NewMemoryStorage(testBaseURL)
++	svc := New(storage, testBaseURL)
+ 
+ 	t.Cleanup(func() {
+ 		if err := svc.Close(); err != nil {
+diff --git a/internal/service/lambda/service.go b/internal/service/lambda/service.go
+index 3071469..c3705d1 100644
+--- a/internal/service/lambda/service.go
++++ b/internal/service/lambda/service.go
+@@ -3,23 +3,22 @@ package lambda
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(defaultBaseURL, opts...), defaultBaseURL))
++		return New(NewMemoryStorage(d.BaseURL, opts...), d.BaseURL)
++	})
+ }
+ 
+ // Service implements the Lambda service.
+diff --git a/internal/service/location/service.go b/internal/service/location/service.go
+index 017de3f..e896817 100644
+--- a/internal/service/location/service.go
++++ b/internal/service/location/service.go
+@@ -4,7 +4,6 @@ package location
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -16,12 +15,14 @@ var _ service.Service = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Amazon Location service.
+diff --git a/internal/service/macie2/service.go b/internal/service/macie2/service.go
+index dd271b9..a574ea1 100644
+--- a/internal/service/macie2/service.go
++++ b/internal/service/macie2/service.go
+@@ -4,7 +4,6 @@ package macie2
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -16,12 +15,14 @@ var _ service.Service = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Amazon Macie2 service.
+diff --git a/internal/service/memorydb/service.go b/internal/service/memorydb/service.go
+index 24a787c..26e4560 100644
+--- a/internal/service/memorydb/service.go
++++ b/internal/service/memorydb/service.go
+@@ -3,7 +3,6 @@ package memorydb
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -42,12 +41,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/mq/service.go b/internal/service/mq/service.go
+index ba1ea85..b2d47c7 100644
+--- a/internal/service/mq/service.go
++++ b/internal/service/mq/service.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Amazon MQ service.
+diff --git a/internal/service/neptune/service.go b/internal/service/neptune/service.go
+index a37a809..9b3bd4b 100644
+--- a/internal/service/neptune/service.go
++++ b/internal/service/neptune/service.go
+@@ -3,7 +3,6 @@ package neptune
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the Neptune service.
+diff --git a/internal/service/organizations/service.go b/internal/service/organizations/service.go
+index 0c82b68..2753373 100644
+--- a/internal/service/organizations/service.go
++++ b/internal/service/organizations/service.go
+@@ -4,7 +4,6 @@ package organizations
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -39,12 +38,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {}
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ var (
+diff --git a/internal/service/pinpointsmsvoicev2/service.go b/internal/service/pinpointsmsvoicev2/service.go
+index a7b7f39..a351e53 100644
+--- a/internal/service/pinpointsmsvoicev2/service.go
++++ b/internal/service/pinpointsmsvoicev2/service.go
+@@ -3,7 +3,6 @@ package pinpointsmsvoicev2
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Pinpoint SMS Voice v2 service.
+diff --git a/internal/service/pipes/service.go b/internal/service/pipes/service.go
+index 0333a21..f0a8493 100644
+--- a/internal/service/pipes/service.go
++++ b/internal/service/pipes/service.go
+@@ -3,7 +3,6 @@ package pipes
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the EventBridge Pipes service.
+diff --git a/internal/service/rds/service.go b/internal/service/rds/service.go
+index 41dfb06..7ec9492 100644
+--- a/internal/service/rds/service.go
++++ b/internal/service/rds/service.go
+@@ -3,7 +3,6 @@ package rds
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the RDS service.
+diff --git a/internal/service/redshift/service.go b/internal/service/redshift/service.go
+index 5b9062f..0af4bf9 100644
+--- a/internal/service/redshift/service.go
++++ b/internal/service/redshift/service.go
+@@ -3,7 +3,6 @@ package redshift
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,13 +14,15 @@ var (
+ )
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the Redshift service.
+diff --git a/internal/service/registry.go b/internal/service/registry.go
+index d8a0029..d8961a6 100644
+--- a/internal/service/registry.go
++++ b/internal/service/registry.go
+@@ -1,21 +1,131 @@
+ package service
+ 
+ import (
++	"os"
+ 	"sync"
++
++	"github.com/sivchari/kumo/internal/streams"
++)
++
++// Deps carries the per-server inputs every Factory receives. A server
++// builds one Deps and uses it for every service it creates, so all
++// services of one server instance share that instance's identity
++// (BaseURL), persistence scope (DataDir) and cross-service state
++// (Streams) and never the state of another concurrently running server.
++type Deps struct {
++	// BaseURL is the URL clients use to reach the owning server listener,
++	// e.g. http://127.0.0.1:51342 for an in-process test server or
++	// http://localhost:4566 for the CLI. Services embed it in resource
++	// URLs they return (QueueUrl, function locations, ...) and use it for
++	// loopback event delivery (S3 -> EventBridge, ...).
++	BaseURL string
++
++	// DataDir is the snapshot directory. Empty means the instance is
++	// fully ephemeral: nothing is loaded or persisted.
++	DataDir string
++
++	// Streams is the DynamoDB stream store shared between the dynamodb
++	// (producer) and dynamodbstreams (consumer) services of the same
++	// server instance.
++	Streams *streams.Store
++
++	// Resolve returns another service of the same server instance by
++	// name. It is safe to call at request time (after the whole instance
++	// has been built); calling it during construction may miss a service
++	// that has not been constructed yet.
++	Resolve func(name string) (Service, bool)
++}
++
++// DefaultDeps returns Deps derived from the process environment. It keeps
++// the historical single-process conventions: KUMO_DATA_DIR enables
++// persistence and the loopback URL is localhost:4566 (or KUMO_HOST /
++// KUMO_PORT when set). It is used for the process-wide singleton set and
++// for standalone usage; multi-instance callers (the in-process test
++// server) build their own Deps instead.
++func DefaultDeps() Deps {
++	host := os.Getenv("KUMO_HOST")
++	port := os.Getenv("KUMO_PORT")
++
++	switch host {
++	case "", "0.0.0.0", "::", "[::]":
++		host = "localhost"
++	}
++
++	if port == "" {
++		port = "4566"
++	}
++
++	return Deps{
++		BaseURL: "http://" + host + ":" + port,
++		DataDir: os.Getenv("KUMO_DATA_DIR"),
++		Streams: streams.NewStore(),
++	}
++}
++
++// Factory constructs a fresh service for one server instance. Each
++// service package registers a Factory from its init() instead of a
++// ready-made singleton, so every server.New gets independent services
++// and storage.
++type Factory func(Deps) Service
++
++var (
++	factoryMu sync.Mutex
++	factories []Factory
+ )
+ 
+-// globalRegistry is the default registry for auto-registration via init().
+-var globalRegistry = NewRegistry()
++// Register adds a service Factory to the process-wide factory catalog.
++// It is called from each service package's init().
++func Register(f Factory) {
++	factoryMu.Lock()
++	defer factoryMu.Unlock()
+ 
+-// Register adds a service to the global registry.
+-// This is typically called from init() in each service package.
+-func Register(svc Service) {
+-	globalRegistry.Register(svc)
++	factories = append(factories, f)
+ }
+ 
+-// Services returns all services from the global registry.
++// Factories returns a copy of every registered Factory.
++func Factories() []Factory {
++	factoryMu.Lock()
++	defer factoryMu.Unlock()
++
++	out := make([]Factory, len(factories))
++	copy(out, factories)
++
++	return out
++}
++
++// BuildAll constructs a fresh instance of every registered service with
++// the given deps.
++func BuildAll(deps Deps) []Service {
++	svcs := make([]Service, 0, len(factories))
++
++	for _, f := range Factories() {
++		svcs = append(svcs, f(deps))
++	}
++
++	return svcs
++}
++
++// defaultInstances is the lazily built process-wide singleton set. It
++// preserves the historical behavior of Services() (used by the CLI /
++// README generators, which only introspect metadata) where every call
++// returns the same instances.
++var (
++	defaultOnce      sync.Once
++	defaultInstances []Service
++)
++
++// Services returns the process-wide singleton service set, building it
++// once from DefaultDeps on first use. Runtime code that needs isolated
++// instances must use Factories/BuildAll instead.
+ func Services() []Service {
+-	return globalRegistry.All()
++	defaultOnce.Do(func() {
++		defaultInstances = BuildAll(DefaultDeps())
++	})
++
++	out := make([]Service, len(defaultInstances))
++	copy(out, defaultInstances)
++
++	return out
+ }
+ 
+ // Registry manages service registration and discovery.
+diff --git a/internal/service/rekognition/service.go b/internal/service/rekognition/service.go
+index 019185e..75d87c6 100644
+--- a/internal/service/rekognition/service.go
++++ b/internal/service/rekognition/service.go
+@@ -3,7 +3,6 @@ package rekognition
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,12 +14,14 @@ var _ service.Service = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the AWS Rekognition service.
+diff --git a/internal/service/resiliencehub/service.go b/internal/service/resiliencehub/service.go
+index 0ec91c7..aac80ae 100644
+--- a/internal/service/resiliencehub/service.go
++++ b/internal/service/resiliencehub/service.go
+@@ -3,7 +3,6 @@ package resiliencehub
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,12 +14,14 @@ var _ service.Service = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Resilience Hub service.
+diff --git a/internal/service/route53/service.go b/internal/service/route53/service.go
+index 1b37ea3..7695cc0 100644
+--- a/internal/service/route53/service.go
++++ b/internal/service/route53/service.go
+@@ -3,7 +3,6 @@ package route53
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage(opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage(opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service is the Route 53 service.
+diff --git a/internal/service/route53resolver/service.go b/internal/service/route53resolver/service.go
+index 9cb05ab..919fc93 100644
+--- a/internal/service/route53resolver/service.go
++++ b/internal/service/route53resolver/service.go
+@@ -3,7 +3,6 @@ package route53resolver
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,12 +14,14 @@ var _ service.JSONProtocolService = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Route 53 Resolver service.
+diff --git a/internal/service/s3/service.go b/internal/service/s3/service.go
+index d1d275d..7300941 100644
+--- a/internal/service/s3/service.go
++++ b/internal/service/s3/service.go
+@@ -41,8 +41,6 @@ type SNSPublisher interface {
+ 	Publish(ctx context.Context, topicARN, message, subject string) error
+ }
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ // snsNotificationSubject is the Subject AWS attaches to S3 event
+ // notification messages published to SNS.
+ const snsNotificationSubject = "Amazon S3 Notification"
+@@ -51,18 +49,14 @@ const snsNotificationSubject = "Amazon S3 Notification"
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	baseURL := defaultBaseURL
+-
+-	if port := os.Getenv("KUMO_PORT"); port != "" {
+-		baseURL = fmt.Sprintf("http://localhost:%s", port)
+-	}
+-
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...), baseURL))
++		return New(NewMemoryStorage(opts...), d.BaseURL)
++	})
+ }
+ 
+ // Service implements the S3 service.
+diff --git a/internal/service/s3control/service.go b/internal/service/s3control/service.go
+index e9afb8a..8e1ddb3 100644
+--- a/internal/service/s3control/service.go
++++ b/internal/service/s3control/service.go
+@@ -3,7 +3,6 @@ package s3control
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the S3 Control service.
+diff --git a/internal/service/s3tables/service.go b/internal/service/s3tables/service.go
+index 51443b6..85db75a 100644
+--- a/internal/service/s3tables/service.go
++++ b/internal/service/s3tables/service.go
+@@ -4,7 +4,6 @@ package s3tables
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the S3 Tables service.
+diff --git a/internal/service/sagemaker/service.go b/internal/service/sagemaker/service.go
+index 7731bf6..6dd86ca 100644
+--- a/internal/service/sagemaker/service.go
++++ b/internal/service/sagemaker/service.go
+@@ -4,7 +4,6 @@ package sagemaker
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the SageMaker service.
+diff --git a/internal/service/scheduler/service.go b/internal/service/scheduler/service.go
+index 69e73e6..ba4d9a6 100644
+--- a/internal/service/scheduler/service.go
++++ b/internal/service/scheduler/service.go
+@@ -4,7 +4,6 @@ package scheduler
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -13,12 +12,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the EventBridge Scheduler service.
+diff --git a/internal/service/secretsmanager/service.go b/internal/service/secretsmanager/service.go
+index a8828e3..900b5be 100644
+--- a/internal/service/secretsmanager/service.go
++++ b/internal/service/secretsmanager/service.go
+@@ -3,23 +3,22 @@ package secretsmanager
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(defaultBaseURL, opts...), defaultBaseURL))
++		return New(NewMemoryStorage(d.BaseURL, opts...), d.BaseURL)
++	})
+ }
+ 
+ // Service implements the Secrets Manager service.
+diff --git a/internal/service/securitylake/service.go b/internal/service/securitylake/service.go
+index 5b94097..062e90f 100644
+--- a/internal/service/securitylake/service.go
++++ b/internal/service/securitylake/service.go
+@@ -3,7 +3,6 @@ package securitylake
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -15,12 +14,14 @@ var _ service.Service = (*Service)(nil)
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the Security Lake service.
+diff --git a/internal/service/servicequotas/service.go b/internal/service/servicequotas/service.go
+index 7811027..ffa035c 100644
+--- a/internal/service/servicequotas/service.go
++++ b/internal/service/servicequotas/service.go
+@@ -4,7 +4,6 @@ package servicequotas
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -39,12 +38,14 @@ func (s *Service) RegisterRoutes(_ service.Router) {}
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ var (
+diff --git a/internal/service/ses/service.go b/internal/service/ses/service.go
+index 543174e..ee09b64 100644
+--- a/internal/service/ses/service.go
++++ b/internal/service/ses/service.go
+@@ -3,7 +3,6 @@ package ses
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the SES v1 service.
+diff --git a/internal/service/sesv2/service.go b/internal/service/sesv2/service.go
+index 6d21e7d..5f96f5e 100644
+--- a/internal/service/sesv2/service.go
++++ b/internal/service/sesv2/service.go
+@@ -3,7 +3,6 @@ package sesv2
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the SES v2 service.
+diff --git a/internal/service/sfn/service.go b/internal/service/sfn/service.go
+index 68445e2..51a8025 100644
+--- a/internal/service/sfn/service.go
++++ b/internal/service/sfn/service.go
+@@ -4,7 +4,6 @@ package sfn
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -46,14 +45,16 @@ func (s *Service) RegisterRoutes(_ service.Router) {
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	opts = append(opts, WithBaseURL(defaultBaseURL))
++		opts = append(opts, WithBaseURL(d.BaseURL))
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Close saves the storage state if persistence is enabled.
+diff --git a/internal/service/sns/service.go b/internal/service/sns/service.go
+index 77e8f54..d766ebd 100644
+--- a/internal/service/sns/service.go
++++ b/internal/service/sns/service.go
+@@ -3,7 +3,6 @@ package sns
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,13 +11,15 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	storage := NewMemoryStorage("", opts...)
+-	service.Register(New(storage))
++		storage := NewMemoryStorage("", opts...)
++		return New(storage)
++	})
+ }
+ 
+ // Service implements the SNS service.
+diff --git a/internal/service/sqs/service.go b/internal/service/sqs/service.go
+index 52457af..5c0bb4d 100644
+--- a/internal/service/sqs/service.go
++++ b/internal/service/sqs/service.go
+@@ -3,23 +3,22 @@ package sqs
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+ 
+-const defaultBaseURL = "http://localhost:4566"
+-
+ // Compile-time check that Service implements io.Closer.
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(defaultBaseURL, opts...), defaultBaseURL))
++		return New(NewMemoryStorage(d.BaseURL, opts...), d.BaseURL)
++	})
+ }
+ 
+ // Service implements the SQS service.
+diff --git a/internal/service/ssm/service.go b/internal/service/ssm/service.go
+index 64efb04..b3ed8f3 100644
+--- a/internal/service/ssm/service.go
++++ b/internal/service/ssm/service.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+@@ -14,12 +13,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the SSM Parameter Store service.
+diff --git a/internal/service/sts/service.go b/internal/service/sts/service.go
+index 9f35720..072577a 100644
+--- a/internal/service/sts/service.go
++++ b/internal/service/sts/service.go
+@@ -3,7 +3,6 @@ package sts
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the STS service.
+diff --git a/internal/service/xray/service.go b/internal/service/xray/service.go
+index 7b2afaa..835e90f 100644
+--- a/internal/service/xray/service.go
++++ b/internal/service/xray/service.go
+@@ -3,7 +3,6 @@ package xray
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ )
+@@ -12,12 +11,14 @@ import (
+ var _ io.Closer = (*Service)(nil)
+ 
+ func init() {
+-	var opts []Option
+-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
+-		opts = append(opts, WithDataDir(dir))
+-	}
++	service.Register(func(d service.Deps) service.Service {
++		var opts []Option
++		if dir := d.DataDir; dir != "" {
++			opts = append(opts, WithDataDir(dir))
++		}
+ 
+-	service.Register(New(NewMemoryStorage(opts...)))
++		return New(NewMemoryStorage(opts...))
++	})
+ }
+ 
+ // Service implements the X-Ray service.
+diff --git a/kumo.go b/kumo.go
+index 821aeeb..72516ed 100644
+--- a/kumo.go
++++ b/kumo.go
+@@ -11,7 +11,10 @@
+ package kumo
+ 
+ import (
++	"net"
+ 	"net/http/httptest"
++	"strconv"
++	"sync"
+ 
+ 	// Register all services via init(). See internal/registry for the
+ 	// single canonical list shared with the CLI and the README generator.
+@@ -26,27 +29,75 @@ type Server struct {
+ 	URL string
+ 
+ 	httpServer *httptest.Server
++	internal   *server.Server
++	closeOnce  sync.Once
+ }
+ 
+ // NewServer creates and starts a new in-process AWS emulator server.
+ // The server listens on a random available port on localhost.
+ // Use srv.URL as the BaseEndpoint for AWS SDK clients.
++//
++// Every server owns an independent set of services, storage and
++// background tasks: multiple NewServer calls in one test binary never
++// share queues, buckets or events, even for identically named resources.
++// Each instance is fully ephemeral — KUMO_DATA_DIR is intentionally
++// ignored here so instances cannot share on-disk state; the CLI keeps
++// KUMO_DATA_DIR persistence.
+ func NewServer() *Server {
++	// Bind the listener before constructing services so every service is
++	// configured with the actual random address. Resource URLs returned to
++	// clients (QueueUrl, function locations, ...) and all loopback event
++	// delivery then target this exact listener rather than localhost:4566.
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		panic(err)
++	}
++
++	host, portStr, err := net.SplitHostPort(ln.Addr().String())
++	if err != nil {
++		panic(err)
++	}
++
++	port, err := strconv.Atoi(portStr)
++	if err != nil {
++		panic(err)
++	}
++
+ 	cfg := server.DefaultConfig()
+ 	cfg.LogLevel = 100 // Suppress all logs in test mode.
++	cfg.Host = host
++	cfg.Port = port
++	cfg.DataDir = "" // Ephemeral: instances must not share snapshots.
++
+ 	internalSrv := server.New(cfg)
+ 
+-	ts := httptest.NewServer(internalSrv.Handler())
++	ts := httptest.NewUnstartedServer(internalSrv.Handler())
++	// Discard the placeholder listener httptest allocated and serve on
++	// the listener whose address the services were built against.
++	_ = ts.Listener.Close()
++	ts.Listener = ln
++	ts.Start()
+ 
+ 	return &Server{
+ 		URL:        ts.URL,
+ 		httpServer: ts,
++		internal:   internalSrv,
+ 	}
+ }
+ 
+-// Close shuts down the server.
++// Close shuts down the server and releases its background work.
++// It stops accepting requests and waits for in-flight handlers to finish
++// before stopping the instance's own dispatchers/delivery goroutines.
++// It is safe to call Close repeatedly or concurrently; only the first
++// call performs the shutdown.
+ func (s *Server) Close() {
+-	if s.httpServer != nil {
++	s.closeOnce.Do(func() {
++		// Stop accepting and let in-flight handlers finish first, so no
++		// handler mutates state or enqueues deliveries during shutdown.
+ 		s.httpServer.Close()
+-	}
++
++		// Then stop this instance's own dispatchers/delivery goroutines
++		// and flush any persistence state.
++		_ = s.internal.Close()
++	})
+ }
+diff --git a/kumo_multi_instance_test.go b/kumo_multi_instance_test.go
+new file mode 100644
+index 0000000..caac6c3
+--- /dev/null
++++ b/kumo_multi_instance_test.go
+@@ -0,0 +1,663 @@
++package kumo_test
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"net/http"
++	"runtime"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	awscfg "github.com/aws/aws-sdk-go-v2/config"
++	"github.com/aws/aws-sdk-go-v2/credentials"
++	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
++	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
++	"github.com/aws/aws-sdk-go-v2/service/lambda"
++	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
++	"github.com/aws/aws-sdk-go-v2/service/s3"
++	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
++	"github.com/aws/aws-sdk-go-v2/service/sns"
++	"github.com/aws/aws-sdk-go-v2/service/sqs"
++	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
++
++	"github.com/sivchari/kumo"
++)
++
++const testRegion = "us-east-1"
++
++func testAWSConfig(t *testing.T) aws.Config {
++	t.Helper()
++
++	cfg, err := awscfg.LoadDefaultConfig(context.Background(),
++		awscfg.WithRegion(testRegion),
++		awscfg.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
++	)
++	if err != nil {
++		t.Fatalf("load aws config: %v", err)
++	}
++
++	return cfg
++}
++
++func sqsClient(cfg aws.Config, url string) *sqs.Client {
++	return sqs.NewFromConfig(cfg, func(o *sqs.Options) {
++		o.BaseEndpoint = aws.String(url)
++	})
++}
++
++func snsClient(cfg aws.Config, url string) *sns.Client {
++	return sns.NewFromConfig(cfg, func(o *sns.Options) {
++		o.BaseEndpoint = aws.String(url)
++	})
++}
++
++func s3Client(cfg aws.Config, url string) *s3.Client {
++	return s3.NewFromConfig(cfg, func(o *s3.Options) {
++		o.BaseEndpoint = aws.String(url)
++		o.UsePathStyle = true
++	})
++}
++
++func cloudwatchClient(cfg aws.Config, url string) *cloudwatch.Client {
++	return cloudwatch.NewFromConfig(cfg, func(o *cloudwatch.Options) {
++		o.BaseEndpoint = aws.String(url)
++	})
++}
++
++func lambdaClient(cfg aws.Config, url string) *lambda.Client {
++	return lambda.NewFromConfig(cfg, func(o *lambda.Options) {
++		o.BaseEndpoint = aws.String(url)
++	})
++}
++
++// mustCreateQueue creates an SQS queue and returns its URL and ARN.
++func mustCreateQueue(t *testing.T, ctx context.Context, c *sqs.Client, name string) (url, arn string) {
++	t.Helper()
++
++	out, err := c.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(name)})
++	if err != nil {
++		t.Fatalf("CreateQueue(%s): %v", name, err)
++	}
++
++	url = aws.ToString(out.QueueUrl)
++
++	attrs, err := c.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
++		QueueUrl:       aws.String(url),
++		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameQueueArn},
++	})
++	if err != nil {
++		t.Fatalf("GetQueueAttributes(%s): %v", name, err)
++	}
++
++	return url, attrs.Attributes[string(sqstypes.QueueAttributeNameQueueArn)]
++}
++
++// receiveOnce runs one short-poll ReceiveMessage.
++func receiveOnce(t *testing.T, ctx context.Context, c *sqs.Client, queueURL string) []sqstypes.Message {
++	t.Helper()
++
++	out, err := c.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
++		QueueUrl:            aws.String(queueURL),
++		MaxNumberOfMessages: 10,
++		WaitTimeSeconds:     1,
++	})
++	if err != nil {
++		t.Fatalf("ReceiveMessage(%s): %v", queueURL, err)
++	}
++
++	return out.Messages
++}
++
++// waitForMessage polls until a message whose body contains substr
++// arrives or the deadline elapses. Received messages are not deleted so
++// failed assertions still surface the queue contents.
++func waitForMessage(t *testing.T, ctx context.Context, c *sqs.Client, queueURL, substr string) sqstypes.Message {
++	t.Helper()
++
++	deadline := time.Now().Add(10 * time.Second)
++
++	for time.Now().Before(deadline) {
++		for _, m := range receiveOnce(t, ctx, c, queueURL) {
++			if substr == "" || strings.Contains(aws.ToString(m.Body), substr) {
++				return m
++			}
++		}
++	}
++
++	t.Fatalf("no message containing %q arrived on %s", substr, queueURL)
++
++	return sqstypes.Message{}
++}
++
++// assertQueueEmpty proves no delivery reached the queue, waiting long
++// enough to catch any cross-instance event that is merely delayed.
++func assertQueueEmpty(t *testing.T, ctx context.Context, c *sqs.Client, queueURL string) {
++	t.Helper()
++
++	// Two long-polls (2s total) cover the window in which the other
++	// instance's delivery goroutine could still be in flight.
++	for range 2 {
++		if msgs := receiveOnce(t, ctx, c, queueURL); len(msgs) != 0 {
++			bodies := make([]string, 0, len(msgs))
++			for _, m := range msgs {
++				bodies = append(bodies, aws.ToString(m.Body))
++			}
++
++			t.Fatalf("queue %s unexpectedly received %d message(s): %s", queueURL, len(msgs), strings.Join(bodies, "\n"))
++		}
++	}
++}
++
++// uniqueSuffix keeps resources from colliding across repeated test runs
++// against a persistent emulator; the isolation checks themselves use the
++// SAME names on both instances.
++func uniqueSuffix() string {
++	return strconv.FormatInt(time.Now().UnixNano(), 10)
++}
++
++// TestMultiServer_IndependentStorageAndEndpoints is the core isolation
++// contract: two NewServer calls side by side must not share data, and
++// every resource URL they return must point at that server's own
++// random listener rather than localhost:4566.
++func TestMultiServer_IndependentStorageAndEndpoints(t *testing.T) {
++	ctx := context.Background()
++
++	srvA := kumo.NewServer()
++	srvB := kumo.NewServer()
++
++	defer srvA.Close()
++	defer srvB.Close()
++
++	if srvA.URL == srvB.URL {
++		t.Fatalf("two servers must listen on different URLs, both are %s", srvA.URL)
++	}
++
++	cfg := testAWSConfig(t)
++	sqsA, sqsB := sqsClient(cfg, srvA.URL), sqsClient(cfg, srvB.URL)
++	s3A, s3B := s3Client(cfg, srvA.URL), s3Client(cfg, srvB.URL)
++	snsA, snsB := snsClient(cfg, srvA.URL), snsClient(cfg, srvB.URL)
++
++	suffix := uniqueSuffix()
++	queueName := "iso-queue-" + suffix
++	bucketName := "iso-bucket-" + suffix
++	topicName := "iso-topic-" + suffix
++
++	// --- SQS: same queue name on both instances ---
++	urlA, _ := mustCreateQueue(t, ctx, sqsA, queueName)
++	urlB, _ := mustCreateQueue(t, ctx, sqsB, queueName)
++
++	if !strings.HasPrefix(urlA, srvA.URL+"/") {
++		t.Errorf("instance A QueueUrl = %q, want prefix %q", urlA, srvA.URL)
++	}
++
++	if !strings.HasPrefix(urlB, srvB.URL+"/") {
++		t.Errorf("instance B QueueUrl = %q, want prefix %q", urlB, srvB.URL)
++	}
++
++	if strings.Contains(urlA, "localhost:4566") || strings.Contains(urlB, "localhost:4566") {
++		t.Errorf("QueueUrl must not fall back to the default port: %q / %q", urlA, urlB)
++	}
++
++	_, err := sqsA.SendMessage(ctx, &sqs.SendMessageInput{
++		QueueUrl:    aws.String(urlA),
++		MessageBody: aws.String("only-instance-A"),
++	})
++	if err != nil {
++		t.Fatalf("SendMessage A: %v", err)
++	}
++
++	msg := waitForMessage(t, ctx, sqsA, urlA, "only-instance-A")
++	_, _ = sqsA.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(urlA), ReceiptHandle: msg.ReceiptHandle})
++
++	assertQueueEmpty(t, ctx, sqsB, urlB)
++
++	// --- S3: same bucket name on both instances ---
++	if _, err := s3A.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucketName)}); err != nil {
++		t.Fatalf("CreateBucket A: %v", err)
++	}
++
++	if _, err := s3B.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucketName)}); err != nil {
++		t.Fatalf("CreateBucket B: %v", err)
++	}
++
++	key := "shared-key"
++
++	if _, err := s3A.PutObject(ctx, &s3.PutObjectInput{
++		Bucket: aws.String(bucketName),
++		Key:    aws.String(key),
++		Body:   bytes.NewReader([]byte("a-payload")),
++	}); err != nil {
++		t.Fatalf("PutObject A: %v", err)
++	}
++
++	if _, err := s3A.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucketName), Key: aws.String(key)}); err != nil {
++		t.Errorf("HeadObject on instance A should succeed: %v", err)
++	}
++
++	var notFound *s3types.NotFound
++	if _, err := s3B.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucketName), Key: aws.String(key)}); !errors.As(err, &notFound) {
++		t.Errorf("HeadObject on instance B should report NotFound, got %v", err)
++	}
++
++	// --- SNS: topic created only on A must not be visible on B ---
++	if _, err := snsA.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String(topicName)}); err != nil {
++		t.Fatalf("CreateTopic A: %v", err)
++	}
++
++	topicsB, err := snsB.ListTopics(ctx, &sns.ListTopicsInput{})
++	if err != nil {
++		t.Fatalf("ListTopics B: %v", err)
++	}
++
++	for _, tp := range topicsB.Topics {
++		if strings.HasSuffix(aws.ToString(tp.TopicArn), ":"+topicName) {
++			t.Fatalf("topic created on instance A leaked into instance B: %s", aws.ToString(tp.TopicArn))
++		}
++	}
++}
++
++// TestMultiServer_LocalEventsStayInInstance verifies that events an
++// instance produces are only delivered to targets owned by that same
++// instance: SNS -> SQS, S3 -> SQS, S3 -> SNS -> SQS and
++// CloudWatch alarm -> SNS -> SQS.
++func TestMultiServer_LocalEventsStayInInstance(t *testing.T) {
++	ctx := context.Background()
++
++	srvA := kumo.NewServer()
++	srvB := kumo.NewServer()
++
++	defer srvA.Close()
++	defer srvB.Close()
++
++	cfg := testAWSConfig(t)
++
++	sqsA, sqsB := sqsClient(cfg, srvA.URL), sqsClient(cfg, srvB.URL)
++	snsA := snsClient(cfg, srvA.URL)
++	s3A, s3B := s3Client(cfg, srvA.URL), s3Client(cfg, srvB.URL)
++	cwA := cloudwatchClient(cfg, srvA.URL)
++
++	suffix := uniqueSuffix()
++
++	// Identically named topics and queues on both instances.
++	topicAOut, err := snsA.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String("events-topic-" + suffix)})
++	if err != nil {
++		t.Fatalf("CreateTopic A: %v", err)
++	}
++
++	topicA := aws.ToString(topicAOut.TopicArn)
++
++	// B must have its own topic with the same local name.
++	topicBOut, err := snsClient(cfg, srvB.URL).CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String("events-topic-" + suffix)})
++	if err != nil {
++		t.Fatalf("CreateTopic B: %v", err)
++	}
++
++	topicB := aws.ToString(topicBOut.TopicArn)
++
++	// Topic ARNs are account/region/name based and therefore identical
++	// across instances; isolation comes from each instance holding its
++	// own topic/queue storage, not from ARN namespacing.
++	_ = topicB
++
++	snsQueueA, snsQueueARN_A := mustCreateQueue(t, ctx, sqsA, "sns-queue-"+suffix)
++	snsQueueB, snsQueueARN_B := mustCreateQueue(t, ctx, sqsB, "sns-queue-"+suffix)
++
++	if _, err := snsA.Subscribe(ctx, &sns.SubscribeInput{
++		TopicArn: aws.String(topicA),
++		Protocol: aws.String("sqs"),
++		Endpoint: aws.String(snsQueueARN_A),
++	}); err != nil {
++		t.Fatalf("Subscribe A: %v", err)
++	}
++
++	if _, err := snsClient(cfg, srvB.URL).Subscribe(ctx, &sns.SubscribeInput{
++		TopicArn: aws.String(topicB),
++		Protocol: aws.String("sqs"),
++		Endpoint: aws.String(snsQueueARN_B),
++	}); err != nil {
++		t.Fatalf("Subscribe B: %v", err)
++	}
++
++	// 1) SNS -> SQS delivery stays on A.
++	if _, err := snsA.Publish(ctx, &sns.PublishInput{
++		TopicArn: aws.String(topicA),
++		Message:  aws.String("sns-message-"+suffix),
++	}); err != nil {
++		t.Fatalf("Publish: %v", err)
++	}
++
++	waitForMessage(t, ctx, sqsA, snsQueueA, "sns-message-"+suffix)
++	assertQueueEmpty(t, ctx, sqsB, snsQueueB)
++
++	// 2) S3 -> SQS and S3 -> SNS -> SQS stay on A. Separate buckets are
++	// used because kumo rejects overlapping event rules within one bucket.
++	sqsBucketName := "events-bucket-sqs-" + suffix
++	snsBucketName := "events-bucket-sns-" + suffix
++
++	for _, b := range []string{sqsBucketName, snsBucketName} {
++		if _, err := s3A.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(b)}); err != nil {
++			t.Fatalf("CreateBucket A %s: %v", b, err)
++		}
++
++		if _, err := s3B.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(b)}); err != nil {
++			t.Fatalf("CreateBucket B %s: %v", b, err)
++		}
++	}
++
++	s3QueueA, s3QueueARN_A := mustCreateQueue(t, ctx, sqsA, "s3-sqs-queue-"+suffix)
++	s3QueueB, _ := mustCreateQueue(t, ctx, sqsB, "s3-sqs-queue-"+suffix)
++
++	s3TopicQueueA, s3TopicQueueARN_A := mustCreateQueue(t, ctx, sqsA, "s3-sns-queue-"+suffix)
++	s3TopicQueueB, _ := mustCreateQueue(t, ctx, sqsB, "s3-sns-queue-"+suffix)
++
++	s3TopicOut, err := snsA.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String("s3-events-topic-" + suffix)})
++	if err != nil {
++		t.Fatalf("CreateTopic s3 A: %v", err)
++	}
++
++	if _, err := snsA.Subscribe(ctx, &sns.SubscribeInput{
++		TopicArn: s3TopicOut.TopicArn,
++		Protocol: aws.String("sqs"),
++		Endpoint: aws.String(s3TopicQueueARN_A),
++	}); err != nil {
++		t.Fatalf("Subscribe s3-topic A: %v", err)
++	}
++
++	if _, err := s3A.PutBucketNotificationConfiguration(ctx,
++		&s3.PutBucketNotificationConfigurationInput{
++			Bucket: aws.String(sqsBucketName),
++			NotificationConfiguration: &s3types.NotificationConfiguration{
++				QueueConfigurations: []s3types.QueueConfiguration{{
++					Id:       aws.String("to-sqs"),
++					QueueArn: aws.String(s3QueueARN_A),
++					Events:   []s3types.Event{s3types.EventS3ObjectCreatedPut},
++				}},
++			},
++		},
++	); err != nil {
++		t.Fatalf("PutBucketNotificationConfiguration(sqs): %v", err)
++	}
++
++	if _, err := s3A.PutBucketNotificationConfiguration(ctx,
++		&s3.PutBucketNotificationConfigurationInput{
++			Bucket: aws.String(snsBucketName),
++			NotificationConfiguration: &s3types.NotificationConfiguration{
++				TopicConfigurations: []s3types.TopicConfiguration{{
++					Id:       aws.String("to-sns"),
++					TopicArn: s3TopicOut.TopicArn,
++					Events:   []s3types.Event{s3types.EventS3ObjectCreatedPut},
++				}},
++			},
++		},
++	); err != nil {
++		t.Fatalf("PutBucketNotificationConfiguration(sns): %v", err)
++	}
++
++	if _, err := s3A.PutObject(ctx, &s3.PutObjectInput{
++		Bucket: aws.String(sqsBucketName),
++		Key:    aws.String("object-on-A"),
++		Body:   bytes.NewReader([]byte("hello")),
++	}); err != nil {
++		t.Fatalf("PutObject A (sqs bucket): %v", err)
++	}
++
++	// The direct S3 -> SQS event.
++	msg := waitForMessage(t, ctx, sqsA, s3QueueA, sqsBucketName)
++	_, _ = sqsA.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(s3QueueA), ReceiptHandle: msg.ReceiptHandle})
++
++	if _, err := s3A.PutObject(ctx, &s3.PutObjectInput{
++		Bucket: aws.String(snsBucketName),
++		Key:    aws.String("object-on-A"),
++		Body:   bytes.NewReader([]byte("hello")),
++	}); err != nil {
++		t.Fatalf("PutObject A (sns bucket): %v", err)
++	}
++
++	// The S3 -> SNS -> SQS event (wrapped twice in envelopes).
++	waitForMessage(t, ctx, sqsA, s3TopicQueueA, "ObjectCreated:Put")
++
++	// Nothing of this should reach B, even though every resource name matches.
++	assertQueueEmpty(t, ctx, sqsB, s3QueueB)
++	assertQueueEmpty(t, ctx, sqsB, s3TopicQueueB)
++
++	// 3) CloudWatch alarm action -> SNS -> SQS stays on A.
++	alarmName := "iso-alarm-" + suffix
++	cwQueueA, cwQueueARN_A := mustCreateQueue(t, ctx, sqsA, "cw-queue-"+suffix)
++	cwQueueB, _ := mustCreateQueue(t, ctx, sqsB, "cw-queue-"+suffix)
++
++	cwTopicOut, err := snsA.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String("cw-topic-" + suffix)})
++	if err != nil {
++		t.Fatalf("CreateTopic cw A: %v", err)
++	}
++
++	if _, err := snsA.Subscribe(ctx, &sns.SubscribeInput{
++		TopicArn: cwTopicOut.TopicArn,
++		Protocol: aws.String("sqs"),
++		Endpoint: aws.String(cwQueueARN_A),
++	}); err != nil {
++		t.Fatalf("Subscribe cw A: %v", err)
++	}
++
++	if _, err := cwA.PutMetricAlarm(ctx, &cloudwatch.PutMetricAlarmInput{
++		AlarmName:          aws.String(alarmName),
++		MetricName:         aws.String("m"),
++		Namespace:          aws.String("kumo/test"),
++		Statistic:          cwtypes.StatisticAverage,
++		Period:             aws.Int32(60),
++		EvaluationPeriods:  aws.Int32(1),
++		Threshold:          aws.Float64(1),
++		ComparisonOperator: cwtypes.ComparisonOperatorGreaterThanThreshold,
++		ActionsEnabled:     aws.Bool(true),
++		AlarmActions:       []string{aws.ToString(cwTopicOut.TopicArn)},
++	}); err != nil {
++		t.Fatalf("PutMetricAlarm: %v", err)
++	}
++
++	if _, err := cwA.SetAlarmState(ctx, &cloudwatch.SetAlarmStateInput{
++		AlarmName:   aws.String(alarmName),
++		StateValue:  cwtypes.StateValueAlarm,
++		StateReason: aws.String("multi-instance isolation test"),
++	}); err != nil {
++		t.Fatalf("SetAlarmState: %v", err)
++	}
++
++	waitForMessage(t, ctx, sqsA, cwQueueA, alarmName)
++	assertQueueEmpty(t, ctx, sqsB, cwQueueB)
++}
++
++// TestMultiServer_LambdaLocationUsesInstanceAddress verifies the
++// function code address handed back to clients points at the owning
++// instance's listener.
++func TestMultiServer_LambdaLocationUsesInstanceAddress(t *testing.T) {
++	ctx := context.Background()
++
++	srvA := kumo.NewServer()
++	srvB := kumo.NewServer()
++
++	defer srvA.Close()
++	defer srvB.Close()
++
++	cfg := testAWSConfig(t)
++	lambdaA, lambdaB := lambdaClient(cfg, srvA.URL), lambdaClient(cfg, srvB.URL)
++
++	fnName := "iso-fn-" + uniqueSuffix()
++	code := &lambdatypes.FunctionCode{ZipFile: []byte("PK\x03\x04dummy")}
++
++	if _, err := lambdaA.CreateFunction(ctx, &lambda.CreateFunctionInput{
++		FunctionName: aws.String(fnName),
++		Runtime:      lambdatypes.RuntimeProvidedal2,
++		Role:         aws.String("arn:aws:iam::000000000000:role/exec"),
++		Handler:      aws.String("bootstrap"),
++		Code:         code,
++	}); err != nil {
++		t.Fatalf("CreateFunction A: %v", err)
++	}
++
++	if _, err := lambdaB.CreateFunction(ctx, &lambda.CreateFunctionInput{
++		FunctionName: aws.String(fnName),
++		Runtime:      lambdatypes.RuntimeProvidedal2,
++		Role:         aws.String("arn:aws:iam::000000000000:role/exec"),
++		Handler:      aws.String("bootstrap"),
++		Code:         code,
++	}); err != nil {
++		t.Fatalf("CreateFunction B: %v", err)
++	}
++
++	outA, err := lambdaA.GetFunction(ctx, &lambda.GetFunctionInput{FunctionName: aws.String(fnName)})
++	if err != nil {
++		t.Fatalf("GetFunction A: %v", err)
++	}
++
++	locA := aws.ToString(outA.Code.Location)
++	if !strings.HasPrefix(locA, srvA.URL+"/lambda-code/") {
++		t.Errorf("function A Location = %q, want prefix %q/lambda-code/", locA, srvA.URL)
++	}
++
++	if strings.Contains(locA, "localhost:4566") {
++		t.Errorf("function Location must not fall back to default port: %q", locA)
++	}
++
++	outB, err := lambdaB.GetFunction(ctx, &lambda.GetFunctionInput{FunctionName: aws.String(fnName)})
++	if err != nil {
++		t.Fatalf("GetFunction B: %v", err)
++	}
++
++	locB := aws.ToString(outB.Code.Location)
++	if !strings.HasPrefix(locB, srvB.URL+"/lambda-code/") {
++		t.Errorf("function B Location = %q, want prefix %q/lambda-code/", locB, srvB.URL)
++	}
++}
++
++// TestMultiServer_CloseIsIndependentAndIdempotent verifies that closing
++// one instance releases its own work, never affects a sibling instance,
++// and is panic-free under repeated and concurrent Close calls.
++func TestMultiServer_CloseIsIndependentAndIdempotent(t *testing.T) {
++	ctx := context.Background()
++
++	cfg := testAWSConfig(t)
++
++	srvA := kumo.NewServer()
++	srvB := kumo.NewServer()
++
++	sqsA := sqsClient(cfg, srvA.URL)
++	sqsB := sqsClient(cfg, srvB.URL)
++
++	if _, err := sqsA.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String("before-close-" + uniqueSuffix())}); err != nil {
++		t.Fatalf("CreateQueue A: %v", err)
++	}
++
++	if _, err := sqsB.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String("before-close-" + uniqueSuffix())}); err != nil {
++		t.Fatalf("CreateQueue B: %v", err)
++	}
++
++	// Repeated Close on A: must be a no-op after the first.
++	srvA.Close()
++	srvA.Close()
++
++	// Concurrent Close on A must not panic on shared channels/resources.
++	var wg sync.WaitGroup
++	for range 8 {
++		wg.Add(1)
++
++		go func() {
++			defer wg.Done()
++			defer func() {
++				if r := recover(); r != nil {
++					t.Errorf("panic during concurrent Close: %v", r)
++				}
++			}()
++
++			srvA.Close()
++		}()
++	}
++
++	wg.Wait()
++
++	// A is no longer serving.
++	if resp, err := http.Get(srvA.URL + "/health"); err == nil {
++		_ = resp.Body.Close()
++		t.Fatalf("instance A should be closed and refuse connections")
++	}
++
++	// B keeps serving and processing after A is gone.
++	urlB, _ := mustCreateQueue(t, ctx, sqsB, "after-close-"+uniqueSuffix())
++
++	if _, err := sqsB.SendMessage(ctx, &sqs.SendMessageInput{
++		QueueUrl:    aws.String(urlB),
++		MessageBody: aws.String("still-alive"),
++	}); err != nil {
++		t.Fatalf("SendMessage B after A closed: %v", err)
++	}
++
++	waitForMessage(t, ctx, sqsB, urlB, "still-alive")
++
++	// Concurrent Close on B right after normal use must also be safe.
++	for range 8 {
++		wg.Add(1)
++
++		go func() {
++			defer wg.Done()
++			defer func() {
++				if r := recover(); r != nil {
++					t.Errorf("panic during concurrent Close B: %v", r)
++				}
++			}()
++
++			srvB.Close()
++		}()
++	}
++
++	wg.Wait()
++}
++
++// TestMultiServer_CloseStopsBackgroundTasks verifies no per-instance
++// background goroutines (notably the DynamoDB TTL reaper) survive Close.
++func TestMultiServer_CloseStopsBackgroundTasks(t *testing.T) {
++	var srvs []*kumo.Server
++
++	for range 4 {
++		srvs = append(srvs, kumo.NewServer())
++	}
++
++	for _, s := range srvs {
++		s.Close()
++	}
++
++	// Give the reapers time to observe their stop channel.
++	deadline := time.Now().Add(3 * time.Second)
++
++	for time.Now().Before(deadline) {
++		if goroutineStacksContain("ttlReaper") == 0 {
++			return
++		}
++
++		time.Sleep(20 * time.Millisecond)
++		runtime.GC()
++	}
++
++	t.Fatalf("dynamodb ttlReaper goroutine(s) still running after Close:\n%s", goroutineDump())
++}
++
++func goroutineStacksContain(substr string) int {
++	n := 0
++
++	for _, g := range strings.Split(goroutineDump(), "\n\n") {
++		if strings.Contains(g, substr) {
++			n++
++		}
++	}
++
++	return n
++}
++
++func goroutineDump() string {
++	buf := make([]byte, 1<<20)
++	size := runtime.Stack(buf, true)
++
++	return string(buf[:size])
++}

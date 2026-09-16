@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 
 	"github.com/sivchari/kumo/internal/service"
 )
@@ -18,12 +17,14 @@ var _ io.Closer = (*Service)(nil)
 const serviceName = "iam"
 
 func init() {
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
+	service.Register(func(d service.Deps) service.Service {
+		var opts []Option
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	service.Register(New(NewMemoryStorage(opts...)))
+		return New(NewMemoryStorage(opts...))
+	})
 }
 
 // Service implements the IAM service.

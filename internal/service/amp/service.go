@@ -21,12 +21,14 @@ const backendEnvVar = "KUMO_AMP_BACKEND"
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
+	service.Register(func(d service.Deps) service.Service {
+		var opts []Option
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	service.Register(New(NewMemoryStorage(opts...), os.Getenv(backendEnvVar)))
+		return New(NewMemoryStorage(opts...), os.Getenv(backendEnvVar))
+	})
 }
 
 // Service implements the AMP service.

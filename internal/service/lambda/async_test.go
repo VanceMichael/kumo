@@ -521,8 +521,10 @@ func newInvokeTestService(t *testing.T, fn, endpoint string) *Service {
 func newInvokeTestServiceMulti(t *testing.T, endpoints map[string]string) *Service {
 	t.Helper()
 
-	storage := NewMemoryStorage(defaultBaseURL)
-	svc := New(storage, defaultBaseURL)
+	const testBaseURL = "http://localhost:4566"
+
+	storage := NewMemoryStorage(testBaseURL)
+	svc := New(storage, testBaseURL)
 
 	t.Cleanup(func() {
 		if err := svc.Close(); err != nil {

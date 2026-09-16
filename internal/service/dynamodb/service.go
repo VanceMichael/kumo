@@ -3,7 +3,6 @@ package dynamodb
 import (
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/sivchari/kumo/internal/service"
 )
@@ -11,15 +10,15 @@ import (
 // Compile-time check that Service implements io.Closer.
 var _ io.Closer = (*Service)(nil)
 
-const defaultBaseURL = "http://localhost:4566"
-
 func init() {
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
+	service.Register(func(d service.Deps) service.Service {
+		opts := []Option{WithStreamStore(d.Streams)}
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	service.Register(New(NewMemoryStorage(defaultBaseURL, opts...)))
+		return New(NewMemoryStorage(d.BaseURL, opts...))
+	})
 }
 
 // Service implements the DynamoDB service.

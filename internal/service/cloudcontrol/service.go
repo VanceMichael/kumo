@@ -15,7 +15,9 @@ import (
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	service.Register(New(defaultRegistry()))
+	service.Register(func(d service.Deps) service.Service {
+		return New(defaultRegistry(serviceResolver(d.Resolve)))
+	})
 }
 
 // Service implements the Cloud Control API service. It dispatches each

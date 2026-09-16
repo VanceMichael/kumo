@@ -13,10 +13,14 @@ import (
 // AssumeRolePolicyDocument arrives as either a JSON string or a structured
 // object, but the IAM storage stores it as a string, so we re-marshal it
 // on the way in and echo the stored string on the way out.
-type awsIAMRole struct{}
+type awsIAMRole struct {
+	resolve serviceResolver
+}
 
 func init() {
-	registerDefaultHandler(&awsIAMRole{})
+	registerDefaultHandler(func(resolve serviceResolver) Handler {
+		return &awsIAMRole{resolve: resolve}
+	})
 }
 
 // roleProperties is the JSON shape AWS::IAM::Role uses on the wire. The
@@ -34,8 +38,8 @@ type roleProperties struct {
 
 func (*awsIAMRole) TypeName() string { return "AWS::IAM::Role" }
 
-func (*awsIAMRole) storage() (iam.Storage, error) {
-	return lookupStorage[iam.Storage]("iam")
+func (h *awsIAMRole) storage() (iam.Storage, error) {
+	return lookupStorage[iam.Storage](h.resolve, "iam")
 }
 
 func (h *awsIAMRole) Create(ctx context.Context, desired []byte) (string, []byte, error) {

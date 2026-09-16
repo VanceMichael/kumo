@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 
 	"github.com/sivchari/kumo/internal/service"
 )
@@ -13,16 +12,18 @@ import (
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
+	service.Register(func(d service.Deps) service.Service {
+		var opts []Option
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	svc := &Service{
-		storage: NewMemoryStorage(opts...),
-	}
+		svc := &Service{
+			storage: NewMemoryStorage(opts...),
+		}
 
-	service.Register(svc)
+		return svc
+	})
 }
 
 // Service implements the Directory Service.

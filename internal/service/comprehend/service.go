@@ -14,7 +14,9 @@ var (
 )
 
 func init() {
-	service.Register(New())
+	service.Register(func(d service.Deps) service.Service {
+		return New()
+	})
 }
 
 // Service implements the AWS Comprehend service.

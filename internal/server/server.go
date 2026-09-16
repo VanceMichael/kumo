@@ -14,11 +14,13 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sivchari/kumo/internal/initdir"
 	"github.com/sivchari/kumo/internal/service"
+	"github.com/sivchari/kumo/internal/streams"
 )
 
 // Config holds the server configuration.
@@ -27,6 +29,7 @@ type Config struct {
 	Port     int
 	LogLevel slog.Level
 	InitDir  string // Directory containing init scripts to execute on startup
+	DataDir  string // Snapshot directory; "" means the instance is ephemeral
 }
 
 // DefaultConfig returns the default server configuration.
@@ -34,12 +37,14 @@ type Config struct {
 // unparseable KUMO_PORT is ignored and the default port is kept.
 // KUMO_LOG_LEVEL (debug|info|warn|error) overrides the default INFO level —
 // useful when benchmarking, where per-request INFO logs dominate CPU.
+// KUMO_DATA_DIR enables snapshot persistence/restart.
 func DefaultConfig() Config {
 	cfg := Config{
 		Host:     "0.0.0.0",
 		Port:     4566,
 		LogLevel: parseLogLevel(os.Getenv("KUMO_LOG_LEVEL"), slog.LevelInfo),
 		InitDir:  os.Getenv("KUMO_INIT_DIR"),
+		DataDir:  os.Getenv("KUMO_DATA_DIR"),
 	}
 
 	if host := os.Getenv("KUMO_HOST"); host != "" {
@@ -53,6 +58,21 @@ func DefaultConfig() Config {
 	}
 
 	return cfg
+}
+
+// BaseURL is the URL clients use to reach this server. Services embed it
+// in resource URLs (QueueUrl, function locations, ...) and use it for
+// loopback event delivery. Wildcard bind addresses (0.0.0.0/::) are
+// reported as localhost because a client can never dial them directly.
+func (c Config) BaseURL() string {
+	host := c.Host
+
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "localhost"
+	}
+
+	return fmt.Sprintf("http://%s:%d", host, c.Port)
 }
 
 func parseLogLevel(s string, def slog.Level) slog.Level {
@@ -80,10 +100,15 @@ type Server struct {
 	cborDispatcher  *CBORProtocolDispatcher
 	logger          *slog.Logger
 	server          *http.Server
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // New creates a new server with the given configuration.
-// Services registered via init() are automatically loaded.
+// Every registered service Factory is invoked for this server, so the
+// returned server owns an independent set of services, storage, routes,
+// cross-service wiring and background tasks: two Servers never share
+// state even when their resource names collide.
 func New(config Config) *Server {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: config.LogLevel,
@@ -105,8 +130,15 @@ func New(config Config) *Server {
 		logger:          logger,
 	}
 
-	for _, svc := range service.Services() {
-		srv.RegisterService(svc)
+	deps := service.Deps{
+		BaseURL: config.BaseURL(),
+		DataDir: config.DataDir,
+		Streams: streams.NewStore(),
+		Resolve: registry.Get,
+	}
+
+	for _, factory := range service.Factories() {
+		srv.RegisterService(factory(deps))
 	}
 
 	// Cross-service wiring (must happen after all services are registered).
@@ -252,15 +284,34 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("failed to shutdown server: %w", err)
 	}
 
-	for _, svc := range s.registry.All() {
-		if c, ok := svc.(io.Closer); ok {
-			if err := c.Close(); err != nil {
-				s.logger.Error("failed to save snapshot", "service", svc.Name(), "error", err)
+	return s.closeServices()
+}
+
+// Close releases this server instance's own background work and
+// persistent state without touching any other instance. It is used by
+// in-process servers whose HTTP listener is owned elsewhere (httptest).
+// Repeated and concurrent calls are safe and return the same result.
+func (s *Server) Close() error {
+	return s.closeServices()
+}
+
+// closeServices closes every service exactly once: each service stops
+// its own background tasks (async dispatchers, TTL reapers, delivery
+// goroutines) and flushes its own snapshot. Services belonging to other
+// server instances are never referenced.
+func (s *Server) closeServices() error {
+	s.closeOnce.Do(func() {
+		for _, svc := range s.registry.All() {
+			if c, ok := svc.(io.Closer); ok {
+				if err := c.Close(); err != nil {
+					s.logger.Error("failed to close service", "service", svc.Name(), "error", err)
+					s.closeErr = err
+				}
 			}
 		}
-	}
+	})
 
-	return nil
+	return s.closeErr
 }
 
 // Run starts the server and handles graceful shutdown.

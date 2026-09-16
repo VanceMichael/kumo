@@ -71,6 +71,16 @@ func WithDataDir(dir string) Option {
 	}
 }
 
+// WithStreamStore wires the storage to a specific DynamoDB streams store.
+// Each server instance passes its own store so its dynamodb and
+// dynamodbstreams services share streams within the instance but never
+// observe another instance's stream records.
+func WithStreamStore(store *streams.Store) Option {
+	return func(s *MemoryStorage) {
+		s.streamStore = store
+	}
+}
+
 // Compile-time interface checks.
 var (
 	_ json.Marshaler   = (*MemoryStorage)(nil)
@@ -86,6 +96,7 @@ type MemoryStorage struct {
 	region      string
 	dataDir     string
 	stopTTL     chan struct{}
+	closeOnce   sync.Once
 	streamStore *streams.Store
 }
 
@@ -225,8 +236,16 @@ func (m *MemoryStorage) saveLocked() {
 	storage.ScheduleSave(m.dataDir, "dynamodb", m.MarshalJSON)
 }
 
-// Close saves the storage state to disk if persistence is enabled.
+// Close stops the background TTL reaper and, when persistence is
+// enabled, saves the storage state to disk. The reaper is stopped for
+// every instance — including ephemeral ones — so closing a server does
+// not leave a goroutine holding the storage alive. closeOnce makes
+// repeated or concurrent Close safe.
 func (m *MemoryStorage) Close() error {
+	m.closeOnce.Do(func() {
+		close(m.stopTTL)
+	})
+
 	if m.dataDir == "" {
 		return nil
 	}

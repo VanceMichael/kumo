@@ -12,16 +12,20 @@ import (
 // awsS3Bucket adapts AWS::S3::Bucket to kumo's S3 storage. The Properties
 // payload is full-schema (null / empty defaults for what kumo doesn't
 // model) so terraform-provider-awscc's "unknown after apply" plan resolves.
-type awsS3Bucket struct{}
+type awsS3Bucket struct {
+	resolve serviceResolver
+}
 
 func init() {
-	registerDefaultHandler(&awsS3Bucket{})
+	registerDefaultHandler(func(resolve serviceResolver) Handler {
+		return &awsS3Bucket{resolve: resolve}
+	})
 }
 
 func (*awsS3Bucket) TypeName() string { return "AWS::S3::Bucket" }
 
-func (*awsS3Bucket) s3Storage() (s3.Storage, error) {
-	return lookupStorage[s3.Storage]("s3")
+func (h *awsS3Bucket) s3Storage() (s3.Storage, error) {
+	return lookupStorage[s3.Storage](h.resolve, "s3")
 }
 
 func (h *awsS3Bucket) Create(ctx context.Context, desiredState []byte) (string, []byte, error) {

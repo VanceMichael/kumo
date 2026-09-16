@@ -52,9 +52,10 @@ type asyncEvent struct {
 // Delivery is retried with exponential backoff, so a 202 from Invoke means
 // "accepted for delivery" rather than "attempted once" (issue #803).
 type asyncDispatcher struct {
-	client *http.Client
-	done   chan struct{}
-	wg     sync.WaitGroup
+	client    *http.Client
+	done      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
@@ -158,9 +159,14 @@ func (d *asyncDispatcher) enqueue(functionName string, deliverer asyncDeliverer,
 }
 
 // close stops all drain goroutines and waits for them to exit. In-flight
-// requests are aborted through each drain goroutine's context.
+// requests are aborted through each drain goroutine's context. It is safe
+// to call repeatedly or concurrently: only the first call closes the
+// shutdown channel; every call waits for the drain goroutines to exit.
 func (d *asyncDispatcher) close() {
-	close(d.done)
+	d.closeOnce.Do(func() {
+		close(d.done)
+	})
+
 	d.wg.Wait()
 }
 

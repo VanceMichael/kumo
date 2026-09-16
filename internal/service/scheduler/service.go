@@ -4,7 +4,6 @@ package scheduler
 import (
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/sivchari/kumo/internal/service"
 )
@@ -13,12 +12,14 @@ import (
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
+	service.Register(func(d service.Deps) service.Service {
+		var opts []Option
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	service.Register(New(NewMemoryStorage(opts...)))
+		return New(NewMemoryStorage(opts...))
+	})
 }
 
 // Service implements the EventBridge Scheduler service.

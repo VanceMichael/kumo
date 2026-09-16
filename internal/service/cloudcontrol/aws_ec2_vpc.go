@@ -12,10 +12,14 @@ import (
 // awsEC2VPC adapts AWS::EC2::VPC to kumo's EC2 storage. Only the fields
 // kumo's storage actually persists are honoured; other CFN properties can
 // be wired through ModifyVpcAttribute later without changing the wire shape.
-type awsEC2VPC struct{}
+type awsEC2VPC struct {
+	resolve serviceResolver
+}
 
 func init() {
-	registerDefaultHandler(&awsEC2VPC{})
+	registerDefaultHandler(func(resolve serviceResolver) Handler {
+		return &awsEC2VPC{resolve: resolve}
+	})
 }
 
 // vpcProperties is the JSON shape AWS::EC2::VPC uses on the wire.
@@ -29,8 +33,8 @@ type vpcProperties struct {
 
 func (*awsEC2VPC) TypeName() string { return "AWS::EC2::VPC" }
 
-func (*awsEC2VPC) storage() (ec2.Storage, error) {
-	return lookupStorage[ec2.Storage]("ec2")
+func (h *awsEC2VPC) storage() (ec2.Storage, error) {
+	return lookupStorage[ec2.Storage](h.resolve, "ec2")
 }
 
 func (h *awsEC2VPC) Create(ctx context.Context, desired []byte) (string, []byte, error) {

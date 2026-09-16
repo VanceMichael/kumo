@@ -12,10 +12,14 @@ import (
 // awsEC2Subnet adapts AWS::EC2::Subnet to the EC2 storage. Like
 // awsEC2VPC, only the fields kumo's storage actually persists are
 // honoured today; the rest can be added without changing the wire shape.
-type awsEC2Subnet struct{}
+type awsEC2Subnet struct {
+	resolve serviceResolver
+}
 
 func init() {
-	registerDefaultHandler(&awsEC2Subnet{})
+	registerDefaultHandler(func(resolve serviceResolver) Handler {
+		return &awsEC2Subnet{resolve: resolve}
+	})
 }
 
 // subnetProperties is the JSON shape AWS::EC2::Subnet uses on the wire.
@@ -29,8 +33,8 @@ type subnetProperties struct {
 
 func (*awsEC2Subnet) TypeName() string { return "AWS::EC2::Subnet" }
 
-func (*awsEC2Subnet) storage() (ec2.Storage, error) {
-	return lookupStorage[ec2.Storage]("ec2")
+func (h *awsEC2Subnet) storage() (ec2.Storage, error) {
+	return lookupStorage[ec2.Storage](h.resolve, "ec2")
 }
 
 func (h *awsEC2Subnet) Create(ctx context.Context, desired []byte) (string, []byte, error) {

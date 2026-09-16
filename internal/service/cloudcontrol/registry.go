@@ -77,24 +77,32 @@ func (r *Registry) Get(typeName string) (Handler, bool) {
 	return h, ok
 }
 
-// defaultHandlers collects the handlers registered via init() in
-// per-resource files. It is appended to from those init() functions so
-// every imported handler shows up in defaultRegistry().
-var defaultHandlers []Handler
+// defaultHandlerFactories builds the built-in resource handlers bound to
+// one server instance's service resolver. Factories — rather than ready
+// handlers — are what per-resource init() functions register, so every
+// server instance gets handlers that resolve sibling services (s3, iam,
+// ec2, ...) within that instance only.
+var defaultHandlerFactories []func(serviceResolver) Handler
 
 // registerDefaultHandler is the entry point per-resource init() functions
-// use, e.g. `func init() { registerDefaultHandler(&S3Bucket{}) }`.
-func registerDefaultHandler(h Handler) {
-	defaultHandlers = append(defaultHandlers, h)
+// use, e.g.
+//
+//	func init() {
+//	    registerDefaultHandler(func(r serviceResolver) Handler {
+//	        return &awsS3Bucket{resolve: r}
+//	    })
+//	}
+func registerDefaultHandler(f func(serviceResolver) Handler) {
+	defaultHandlerFactories = append(defaultHandlerFactories, f)
 }
 
-// defaultRegistry builds a Registry populated with everything registered
-// via registerDefaultHandler. Tests that want a focused registry can call
-// NewRegistry() and Register() directly instead.
-func defaultRegistry() *Registry {
+// defaultRegistry builds a Registry populated with every built-in
+// handler, each bound to resolve. Tests that want a focused registry can
+// call NewRegistry() and Register() directly instead.
+func defaultRegistry(resolve serviceResolver) *Registry {
 	r := NewRegistry()
-	for _, h := range defaultHandlers {
-		r.Register(h)
+	for _, f := range defaultHandlerFactories {
+		r.Register(f(resolve))
 	}
 
 	return r

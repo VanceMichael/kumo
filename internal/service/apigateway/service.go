@@ -4,25 +4,25 @@ package apigateway
 import (
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/sivchari/kumo/internal/service"
-	"github.com/sivchari/kumo/internal/service/execapi"
 )
 
 // Compile-time check that Service implements io.Closer.
 var _ io.Closer = (*Service)(nil)
 
 func init() {
-	var opts []Option
-	if dir := os.Getenv("KUMO_DATA_DIR"); dir != "" {
-		opts = append(opts, WithDataDir(dir))
-	}
+	service.Register(func(d service.Deps) service.Service {
+		var opts []Option
+		if dir := d.DataDir; dir != "" {
+			opts = append(opts, WithDataDir(dir))
+		}
 
-	svc := New(NewMemoryStorage(opts...))
-	svc.baseURL = execapi.ResolveBaseURL()
+		svc := New(NewMemoryStorage(opts...))
+		svc.baseURL = d.BaseURL
 
-	service.Register(svc)
+		return svc
+	})
 }
 
 // Service implements the API Gateway service.
