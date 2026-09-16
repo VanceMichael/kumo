@@ -1,6 +1,7 @@
 package lambda
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -24,20 +25,46 @@ func init() {
 
 // Service implements the Lambda service.
 type Service struct {
-	storage Storage
-	baseURL string
-	broker  *runtimeBroker
-	async   *asyncDispatcher
+	storage    Storage
+	baseURL    string
+	lifecycles *lifecycleRegistry
+	broker     *runtimeBroker
+	async      *asyncDispatcher
 }
 
 // New creates a new Lambda service.
 func New(storage Storage, baseURL string) *Service {
-	return &Service{
-		storage: storage,
-		baseURL: baseURL,
-		broker:  newRuntimeBroker(),
-		async:   newAsyncDispatcher(),
+	dispatcher := newAsyncDispatcher()
+
+	s := &Service{
+		storage:    storage,
+		baseURL:    baseURL,
+		async:      dispatcher,
+		lifecycles: newLifecycleRegistry(dispatcher.done),
+		broker:     newRuntimeBroker(dispatcher.done),
 	}
+
+	// Functions restored from a persistence snapshot exist in storage but
+	// were created in a previous process; give each a fresh live generation.
+	s.restoreGenerations()
+
+	return s
+}
+
+// restoreGenerations creates live generations for every function already in
+// storage (startup with persistence enabled).
+func (s *Service) restoreGenerations() {
+	fns, _, err := s.storage.ListFunctions(context.Background(), "", 100000)
+	if err != nil {
+		return
+	}
+
+	names := make([]string, 0, len(fns))
+	for _, fn := range fns {
+		names = append(names, fn.FunctionName)
+	}
+
+	s.lifecycles.bootstrap(names)
 }
 
 // Name returns the service name.

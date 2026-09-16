@@ -64,6 +64,14 @@ func newTestDispatcher(t *testing.T) *asyncDispatcher {
 	return d
 }
 
+// newTestGeneration creates an isolated function generation for dispatcher-
+// and broker-level tests that do not need a Service or a registry.
+func newTestGeneration(t *testing.T, d *asyncDispatcher, name string) *functionGeneration {
+	t.Helper()
+
+	return newFunctionGeneration(1, name, d.done)
+}
+
 // payloadRecorder is an HTTP handler that records request bodies in order.
 type payloadRecorder struct {
 	mu       sync.Mutex
@@ -110,11 +118,12 @@ func TestAsyncDispatcher_DeliversAfterEndpointRecovers(t *testing.T) {
 	d := newTestDispatcher(t)
 	addr := reserveAddr(t)
 
+	g := newTestGeneration(t, d, "fn")
 	endpoint := "http://" + addr + "/invoke"
-	deliverer := &endpointDeliverer{client: d.client, endpoint: endpoint, gate: d.gate("fn")}
+	deliverer := &endpointDeliverer{client: d.client, endpoint: endpoint, gate: g.gate}
 
 	for i := 1; i <= 3; i++ {
-		d.enqueue("fn", deliverer, fmt.Appendf(nil, `{"seq":%d}`, i))
+		d.enqueue(g, deliverer, fmt.Appendf(nil, `{"seq":%d}`, i))
 	}
 
 	// Give the dispatcher time to fail at least one attempt.
@@ -171,7 +180,9 @@ func TestAsyncDispatcher_FunctionErrorRetries(t *testing.T) {
 		return attempts
 	}
 
-	d.enqueue("fn", &endpointDeliverer{client: d.client, endpoint: srv.URL, gate: d.gate("fn")}, []byte(`{}`))
+	g := newTestGeneration(t, d, "fn")
+
+	d.enqueue(g, &endpointDeliverer{client: d.client, endpoint: srv.URL, gate: g.gate}, []byte(`{}`))
 
 	wantAttempts := 1 + asyncMaxFunctionErrorRetries
 	if !waitFor(t, 5*time.Second, func() bool { return count() == wantAttempts }) {
@@ -193,8 +204,9 @@ func TestAsyncDispatcher_ExpiredEventDropped(t *testing.T) {
 	d.maxEventAge = 30 * time.Millisecond
 
 	addr := reserveAddr(t)
+	g := newTestGeneration(t, d, "fn")
 
-	d.enqueue("fn", &endpointDeliverer{client: d.client, endpoint: "http://" + addr + "/invoke", gate: d.gate("fn")}, []byte(`{}`))
+	d.enqueue(g, &endpointDeliverer{client: d.client, endpoint: "http://" + addr + "/invoke", gate: g.gate}, []byte(`{}`))
 
 	// Wait until the event is past its deadline and has been dropped.
 	time.Sleep(200 * time.Millisecond)
@@ -220,13 +232,15 @@ func TestAsyncDispatcher_CloseDoesNotHangOnStuckGate(t *testing.T) {
 	d.initialBackoff = 5 * time.Millisecond
 	d.maxBackoff = 20 * time.Millisecond
 
-	gate := d.gate("fn")
+	g := newFunctionGeneration(1, "fn", d.done)
+
+	gate := g.gate
 	if !gate.acquire(t.Context()) {
 		t.Fatal("failed to acquire gate")
 	}
 	// Deliberately never released: simulates a sync invoke stuck forever.
 
-	d.enqueue("fn", &endpointDeliverer{client: d.client, endpoint: "http://127.0.0.1:0/invoke", gate: gate}, []byte(`{}`))
+	d.enqueue(g, &endpointDeliverer{client: d.client, endpoint: "http://127.0.0.1:0/invoke", gate: gate}, []byte(`{}`))
 
 	// Give the drain goroutine time to start waiting on the (permanently
 	// held) gate before closing.
@@ -248,20 +262,20 @@ func TestAsyncDispatcher_CloseDoesNotHangOnStuckGate(t *testing.T) {
 
 // runHandler simulates a Runtime API handler (lambda.Start) that repeatedly
 // polls broker.next and answers with respond, until the test ends.
-func runHandler(t *testing.T, broker *runtimeBroker, fn string, respond func(inv *runtimeInvocation) (payload []byte, errored bool)) {
+func runHandler(t *testing.T, broker *runtimeBroker, g *functionGeneration, respond func(inv *runtimeInvocation) (payload []byte, errored bool)) {
 	t.Helper()
 
 	ctx := t.Context()
 
 	go func() {
 		for {
-			inv, err := broker.next(ctx, fn)
+			inv, err := broker.next(ctx, g)
 			if err != nil {
 				return
 			}
 
 			payload, errored := respond(inv)
-			broker.respond(fn, inv.id, payload, errored)
+			broker.respond(g, inv.id, payload, errored)
 		}
 	}()
 }
@@ -272,7 +286,8 @@ func runHandler(t *testing.T, broker *runtimeBroker, fn string, respond func(inv
 // in FIFO order, instead of the second vanishing.
 func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
 	d := newTestDispatcher(t)
-	broker := newRuntimeBroker()
+	g := newTestGeneration(t, d, "fn")
+	broker := newRuntimeBroker(d.done)
 
 	var (
 		mu    sync.Mutex
@@ -280,7 +295,7 @@ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
 		first = true
 	)
 
-	runHandler(t, broker, "fn", func(inv *runtimeInvocation) ([]byte, bool) {
+	runHandler(t, broker, g, func(inv *runtimeInvocation) ([]byte, bool) {
 		if first {
 			first = false
 
@@ -294,9 +309,9 @@ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
 		return inv.payload, false
 	})
 
-	deliverer := &runtimeDeliverer{broker: broker, fn: "fn"}
-	d.enqueue("fn", deliverer, []byte(`{"seq":1}`))
-	d.enqueue("fn", deliverer, []byte(`{"seq":2}`))
+	deliverer := &runtimeDeliverer{broker: broker, g: g}
+	d.enqueue(g, deliverer, []byte(`{"seq":1}`))
+	d.enqueue(g, deliverer, []byte(`{"seq":2}`))
 
 	if !waitFor(t, 5*time.Second, func() bool {
 		mu.Lock()
@@ -328,34 +343,26 @@ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
 // polling, instead of vanishing.
 func TestAsyncDispatcher_RuntimeDeliveredAfterHandlerPollsLate(t *testing.T) {
 	d := newTestDispatcher(t)
-	broker := newRuntimeBroker()
-
-	// Register the function (as broker.registered would report it) without
-	// any goroutine blocked in next — mirrors a handler that polled once
-	// before and is briefly not polling now.
-	broker.get("fn")
-
-	if !broker.registered("fn") {
-		t.Fatal("expected function to be registered")
-	}
+	g := newTestGeneration(t, d, "fn")
+	broker := newRuntimeBroker(d.done)
 
 	received := make(chan []byte, 1)
 
-	deliverer := &runtimeDeliverer{broker: broker, fn: "fn", waitTimeout: 20 * time.Millisecond}
-	d.enqueue("fn", deliverer, []byte(`{"late":true}`))
+	deliverer := &runtimeDeliverer{broker: broker, g: g, waitTimeout: 20 * time.Millisecond}
+	d.enqueue(g, deliverer, []byte(`{"late":true}`))
 
 	// Let the deliverer's first wait (and at least one retry) time out
 	// before the handler starts polling.
 	time.Sleep(80 * time.Millisecond)
 
 	go func() {
-		inv, err := broker.next(t.Context(), "fn")
+		inv, err := broker.next(t.Context(), g)
 		if err != nil {
 			return
 		}
 
 		received <- inv.payload
-		broker.respond("fn", inv.id, inv.payload, false)
+		broker.respond(g, inv.id, inv.payload, false)
 	}()
 
 	select {
@@ -374,14 +381,15 @@ func TestAsyncDispatcher_RuntimeDeliveredAfterHandlerPollsLate(t *testing.T) {
 // the endpoint path's retry semantics.
 func TestAsyncDispatcher_RuntimeFunctionErrorRetries(t *testing.T) {
 	d := newTestDispatcher(t)
-	broker := newRuntimeBroker()
+	g := newTestGeneration(t, d, "fn")
+	broker := newRuntimeBroker(d.done)
 
 	var (
 		mu       sync.Mutex
 		attempts int
 	)
 
-	runHandler(t, broker, "fn", func(inv *runtimeInvocation) ([]byte, bool) {
+	runHandler(t, broker, g, func(inv *runtimeInvocation) ([]byte, bool) {
 		mu.Lock()
 		attempts++
 		mu.Unlock()
@@ -396,7 +404,7 @@ func TestAsyncDispatcher_RuntimeFunctionErrorRetries(t *testing.T) {
 		return attempts
 	}
 
-	d.enqueue("fn", &runtimeDeliverer{broker: broker, fn: "fn"}, []byte(`{}`))
+	d.enqueue(g, &runtimeDeliverer{broker: broker, g: g}, []byte(`{}`))
 
 	wantAttempts := 1 + asyncMaxFunctionErrorRetries
 	if !waitFor(t, 5*time.Second, func() bool { return count() == wantAttempts }) {
@@ -418,7 +426,8 @@ func TestAsyncDispatcher_RuntimeFunctionErrorRetries(t *testing.T) {
 // async invocation semantics for a function timeout.
 func TestAsyncDispatcher_RuntimeFunctionErrorOnResponseTimeout(t *testing.T) {
 	d := newTestDispatcher(t)
-	broker := newRuntimeBroker()
+	g := newTestGeneration(t, d, "fn")
+	broker := newRuntimeBroker(d.done)
 
 	var (
 		mu       sync.Mutex
@@ -432,7 +441,7 @@ func TestAsyncDispatcher_RuntimeFunctionErrorOnResponseTimeout(t *testing.T) {
 			// Poll and take the invocation, then never respond —
 			// simulates a handler whose function timed out after
 			// picking up the work.
-			_, err := broker.next(ctx, "fn")
+			_, err := broker.next(ctx, g)
 			if err != nil {
 				return
 			}
@@ -450,8 +459,8 @@ func TestAsyncDispatcher_RuntimeFunctionErrorOnResponseTimeout(t *testing.T) {
 		return attempts
 	}
 
-	deliverer := &runtimeDeliverer{broker: broker, fn: "fn", waitTimeout: 20 * time.Millisecond}
-	d.enqueue("fn", deliverer, []byte(`{}`))
+	deliverer := &runtimeDeliverer{broker: broker, g: g, waitTimeout: 20 * time.Millisecond}
+	d.enqueue(g, deliverer, []byte(`{}`))
 
 	wantAttempts := 1 + asyncMaxFunctionErrorRetries
 	if !waitFor(t, 5*time.Second, func() bool { return count() == wantAttempts }) {
@@ -539,6 +548,9 @@ func newInvokeTestServiceMulti(t *testing.T, endpoints map[string]string) *Servi
 			t.Fatalf("create function %s: %v", fn, err)
 		}
 	}
+
+	// Storage was populated directly; create the matching live generations.
+	svc.restoreGenerations()
 
 	return svc
 }

@@ -1,0 +1,2249 @@
+diff --git a/internal/service/lambda/async.go b/internal/service/lambda/async.go
+index ef50434..afb3753 100644
+--- a/internal/service/lambda/async.go
++++ b/internal/service/lambda/async.go
+@@ -47,10 +47,11 @@ type asyncEvent struct {
+ 	deadline  time.Time
+ }
+ 
+-// asyncDispatcher queues Event invocations per function and delivers them in
+-// FIFO order via each event's asyncDeliverer (InvokeEndpoint or Runtime API).
+-// Delivery is retried with exponential backoff, so a 202 from Invoke means
+-// "accepted for delivery" rather than "attempted once" (issue #803).
++// asyncDispatcher owns the process-wide machinery behind Event invocations:
++// the HTTP client, retry/backoff configuration, the service shutdown signal
++// and the WaitGroup tracking every drain goroutine. Per-function state
++// (queues, gates, runtime handoff) lives on functionGeneration so it is
++// drained and retired together with the function resource.
+ type asyncDispatcher struct {
+ 	client *http.Client
+ 	done   chan struct{}
+@@ -59,10 +60,6 @@ type asyncDispatcher struct {
+ 	initialBackoff time.Duration
+ 	maxBackoff     time.Duration
+ 	maxEventAge    time.Duration
+-
+-	mu     sync.Mutex
+-	queues map[string]chan *asyncEvent
+-	gates  map[string]invokeGate
+ }
+ 
+ func newAsyncDispatcher() *asyncDispatcher {
+@@ -72,38 +69,17 @@ func newAsyncDispatcher() *asyncDispatcher {
+ 		initialBackoff: asyncInitialBackoff,
+ 		maxBackoff:     asyncMaxBackoff,
+ 		maxEventAge:    asyncMaxEventAge,
+-		queues:         make(map[string]chan *asyncEvent),
+-		gates:          make(map[string]invokeGate),
+ 	}
+ }
+ 
+-// gate returns (creating if needed) the semaphore that serializes every
+-// InvokeEndpoint HTTP call for functionName, synchronous and asynchronous
+-// alike, so a single-concurrency endpoint (e.g. the Lambda RIE) never
+-// receives two overlapping requests (issue #859). The dispatcher's own mu
+-// only guards the lookup/creation below; it is never held while a caller
+-// blocks on the returned gate.
+-func (d *asyncDispatcher) gate(functionName string) invokeGate {
+-	d.mu.Lock()
+-	defer d.mu.Unlock()
+-
+-	g, ok := d.gates[functionName]
+-	if !ok {
+-		g = newInvokeGate()
+-		d.gates[functionName] = g
+-	}
+-
+-	return g
+-}
+-
+ // invokeGate is a binary semaphore (a capacity-1 channel) that serializes
+-// InvokeEndpoint HTTP calls for one function across the synchronous and
+-// asynchronous invoke paths. Acquisition is context-aware: a caller gives up
+-// waiting when its context is done instead of blocking forever on a peer
+-// that never releases the gate. This matters most for the async drain
+-// goroutine, whose delivery context is canceled when the dispatcher closes —
+-// without that, a stuck synchronous invoke holding the gate would prevent
+-// asyncDispatcher.close from ever returning.
++// InvokeEndpoint HTTP calls for one generation across the synchronous and
++// asynchronous invoke paths. Acquisition is context-aware: a caller gives
++// up waiting when its context is done instead of blocking forever on a
++// peer that never releases the gate. This matters most for the async drain
++// goroutine, whose delivery context is canceled when the dispatcher closes
++// — without that, a stuck synchronous invoke holding the gate would
++// prevent asyncDispatcher.close from ever returning.
+ type invokeGate chan struct{}
+ 
+ func newInvokeGate() invokeGate {
+@@ -125,36 +101,55 @@ func (g invokeGate) release() {
+ 	<-g
+ }
+ 
+-// enqueue places an event on the function's FIFO queue without blocking the
+-// caller. The drain goroutine for the function is started on first use.
+-func (d *asyncDispatcher) enqueue(functionName string, deliverer asyncDeliverer, payload []byte) {
+-	payloadCopy := make([]byte, len(payload))
+-	copy(payloadCopy, payload)
++// enqueue places an event on the generation's FIFO queue and accounts for
++// it as in-flight work before the caller can return 202, so a concurrent
++// DeleteFunction is guaranteed to wait for it. It returns false when the
++// generation's delete boundary has already been set, in which case nothing
++// was queued and the caller must reject the invocation. Enqueue itself
++// never blocks: a full queue is reported as a dropped event whose work
++// count is released immediately.
++func (d *asyncDispatcher) enqueue(g *functionGeneration, deliverer asyncDeliverer, payload []byte) bool {
++	g.admMu.Lock()
++	if g.deleting {
++		g.admMu.Unlock()
+ 
+-	ev := &asyncEvent{
+-		deliverer: deliverer,
+-		payload:   payloadCopy,
+-		deadline:  time.Now().Add(d.maxEventAge),
++		return false
+ 	}
+ 
+-	d.mu.Lock()
++	g.inflight++
++
++	if g.queue == nil {
++		g.queue = make(chan *asyncEvent, asyncQueueCapacity)
++	}
+ 
+-	q, ok := d.queues[functionName]
+-	if !ok {
+-		q = make(chan *asyncEvent, asyncQueueCapacity)
+-		d.queues[functionName] = q
++	if !g.drainStarted {
++		g.drainStarted = true
+ 
+ 		d.wg.Add(1)
+ 
+-		go d.drain(functionName, q)
++		go d.drain(g)
++	}
++
++	q := g.queue
++	g.admMu.Unlock()
++
++	payloadCopy := make([]byte, len(payload))
++	copy(payloadCopy, payload)
++
++	ev := &asyncEvent{
++		deliverer: deliverer,
++		payload:   payloadCopy,
++		deadline:  time.Now().Add(d.maxEventAge),
+ 	}
+-	d.mu.Unlock()
+ 
+ 	select {
+ 	case q <- ev:
+ 	default:
+-		slog.Error("async invoke queue full, event dropped", "function", functionName)
++		g.workDone()
++		slog.Error("async invoke queue full, event dropped", "function", g.name)
+ 	}
++
++	return true
+ }
+ 
+ // close stops all drain goroutines and waits for them to exit. In-flight
+@@ -165,13 +160,13 @@ func (d *asyncDispatcher) close() {
+ }
+ 
+ // drain delivers queued events one at a time. Head-of-line blocking is
+-// deliberate: it preserves per-function delivery order.
+-func (d *asyncDispatcher) drain(functionName string, q chan *asyncEvent) {
++// deliberate: it preserves per-function delivery order. The goroutine exits
++// on service shutdown or when its generation has been drained and retired.
++func (d *asyncDispatcher) drain(g *functionGeneration) {
+ 	defer d.wg.Done()
+ 
+ 	// Lifecycle context for this goroutine's deliveries, canceled when the
+-	// dispatcher closes so in-flight requests are aborted. Created here and
+-	// passed down instead of being stored on the dispatcher.
++	// dispatcher closes so in-flight requests are aborted.
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+ 
+@@ -187,8 +182,10 @@ func (d *asyncDispatcher) drain(functionName string, q chan *asyncEvent) {
+ 		select {
+ 		case <-d.done:
+ 			return
+-		case ev := <-q:
+-			d.deliver(ctx, functionName, ev)
++		case <-g.stopDrain:
++			return
++		case ev := <-g.queue:
++			d.deliver(ctx, g, ev)
+ 		}
+ 	}
+ }
+@@ -207,20 +204,24 @@ const (
+ 	asyncPermanentFailure
+ )
+ 
+-// deliver hands the event to its deliverer, retrying failures until the event
+-// is delivered, exhausts its function-error retries, or expires.
+-func (d *asyncDispatcher) deliver(ctx context.Context, functionName string, ev *asyncEvent) {
++// deliver hands the event to its deliverer, retrying failures until the
++// event is delivered, exhausts its function-error retries, or expires. The
++// event's work count — acquired in enqueue — is released when it reaches a
++// terminal state, which is exactly what DeleteFunction waits for.
++func (d *asyncDispatcher) deliver(ctx context.Context, g *functionGeneration, ev *asyncEvent) {
++	defer g.workDone()
++
+ 	backoff := d.initialBackoff
+ 	functionErrorRetries := 0
+ 
+ 	for {
+-		switch ev.deliverer.deliver(ctx, functionName, ev.payload) {
++		switch ev.deliverer.deliver(ctx, g.name, ev.payload) {
+ 		case asyncDelivered, asyncPermanentFailure:
+ 			return
+ 		case asyncFunctionError:
+ 			if functionErrorRetries >= asyncMaxFunctionErrorRetries {
+ 				slog.Error("async invoke dropped after function error retries",
+-					"function", functionName, "retries", functionErrorRetries)
++					"function", g.name, "retries", functionErrorRetries)
+ 
+ 				return
+ 			}
+@@ -228,7 +229,7 @@ func (d *asyncDispatcher) deliver(ctx context.Context, functionName string, ev *
+ 			functionErrorRetries++
+ 		case asyncSystemError:
+ 			if time.Now().After(ev.deadline) {
+-				slog.Error("async invoke dropped, event expired", "function", functionName)
++				slog.Error("async invoke dropped, event expired", "function", g.name)
+ 
+ 				return
+ 			}
+@@ -252,8 +253,7 @@ type endpointDeliverer struct {
+ 	endpoint string
+ 
+ 	// gate serializes this attempt's HTTP call against every other
+-	// InvokeEndpoint call (sync or async) for the same function; see
+-	// asyncDispatcher.gate.
++	// InvokeEndpoint call (sync or async) for the same generation.
+ 	gate invokeGate
+ }
+ 
+diff --git a/internal/service/lambda/async_test.go b/internal/service/lambda/async_test.go
+index ce6aa0c..0cbde6c 100644
+--- a/internal/service/lambda/async_test.go
++++ b/internal/service/lambda/async_test.go
+@@ -64,6 +64,14 @@ func newTestDispatcher(t *testing.T) *asyncDispatcher {
+ 	return d
+ }
+ 
++// newTestGeneration creates an isolated function generation for dispatcher-
++// and broker-level tests that do not need a Service or a registry.
++func newTestGeneration(t *testing.T, d *asyncDispatcher, name string) *functionGeneration {
++	t.Helper()
++
++	return newFunctionGeneration(1, name, d.done)
++}
++
+ // payloadRecorder is an HTTP handler that records request bodies in order.
+ type payloadRecorder struct {
+ 	mu       sync.Mutex
+@@ -110,11 +118,12 @@ func TestAsyncDispatcher_DeliversAfterEndpointRecovers(t *testing.T) {
+ 	d := newTestDispatcher(t)
+ 	addr := reserveAddr(t)
+ 
++	g := newTestGeneration(t, d, "fn")
+ 	endpoint := "http://" + addr + "/invoke"
+-	deliverer := &endpointDeliverer{client: d.client, endpoint: endpoint, gate: d.gate("fn")}
++	deliverer := &endpointDeliverer{client: d.client, endpoint: endpoint, gate: g.gate}
+ 
+ 	for i := 1; i <= 3; i++ {
+-		d.enqueue("fn", deliverer, fmt.Appendf(nil, `{"seq":%d}`, i))
++		d.enqueue(g, deliverer, fmt.Appendf(nil, `{"seq":%d}`, i))
+ 	}
+ 
+ 	// Give the dispatcher time to fail at least one attempt.
+@@ -171,7 +180,9 @@ func TestAsyncDispatcher_FunctionErrorRetries(t *testing.T) {
+ 		return attempts
+ 	}
+ 
+-	d.enqueue("fn", &endpointDeliverer{client: d.client, endpoint: srv.URL, gate: d.gate("fn")}, []byte(`{}`))
++	g := newTestGeneration(t, d, "fn")
++
++	d.enqueue(g, &endpointDeliverer{client: d.client, endpoint: srv.URL, gate: g.gate}, []byte(`{}`))
+ 
+ 	wantAttempts := 1 + asyncMaxFunctionErrorRetries
+ 	if !waitFor(t, 5*time.Second, func() bool { return count() == wantAttempts }) {
+@@ -193,8 +204,9 @@ func TestAsyncDispatcher_ExpiredEventDropped(t *testing.T) {
+ 	d.maxEventAge = 30 * time.Millisecond
+ 
+ 	addr := reserveAddr(t)
++	g := newTestGeneration(t, d, "fn")
+ 
+-	d.enqueue("fn", &endpointDeliverer{client: d.client, endpoint: "http://" + addr + "/invoke", gate: d.gate("fn")}, []byte(`{}`))
++	d.enqueue(g, &endpointDeliverer{client: d.client, endpoint: "http://" + addr + "/invoke", gate: g.gate}, []byte(`{}`))
+ 
+ 	// Wait until the event is past its deadline and has been dropped.
+ 	time.Sleep(200 * time.Millisecond)
+@@ -220,13 +232,15 @@ func TestAsyncDispatcher_CloseDoesNotHangOnStuckGate(t *testing.T) {
+ 	d.initialBackoff = 5 * time.Millisecond
+ 	d.maxBackoff = 20 * time.Millisecond
+ 
+-	gate := d.gate("fn")
++	g := newFunctionGeneration(1, "fn", d.done)
++
++	gate := g.gate
+ 	if !gate.acquire(t.Context()) {
+ 		t.Fatal("failed to acquire gate")
+ 	}
+ 	// Deliberately never released: simulates a sync invoke stuck forever.
+ 
+-	d.enqueue("fn", &endpointDeliverer{client: d.client, endpoint: "http://127.0.0.1:0/invoke", gate: gate}, []byte(`{}`))
++	d.enqueue(g, &endpointDeliverer{client: d.client, endpoint: "http://127.0.0.1:0/invoke", gate: gate}, []byte(`{}`))
+ 
+ 	// Give the drain goroutine time to start waiting on the (permanently
+ 	// held) gate before closing.
+@@ -248,20 +262,20 @@ func TestAsyncDispatcher_CloseDoesNotHangOnStuckGate(t *testing.T) {
+ 
+ // runHandler simulates a Runtime API handler (lambda.Start) that repeatedly
+ // polls broker.next and answers with respond, until the test ends.
+-func runHandler(t *testing.T, broker *runtimeBroker, fn string, respond func(inv *runtimeInvocation) (payload []byte, errored bool)) {
++func runHandler(t *testing.T, broker *runtimeBroker, g *functionGeneration, respond func(inv *runtimeInvocation) (payload []byte, errored bool)) {
+ 	t.Helper()
+ 
+ 	ctx := t.Context()
+ 
+ 	go func() {
+ 		for {
+-			inv, err := broker.next(ctx, fn)
++			inv, err := broker.next(ctx, g)
+ 			if err != nil {
+ 				return
+ 			}
+ 
+ 			payload, errored := respond(inv)
+-			broker.respond(fn, inv.id, payload, errored)
++			broker.respond(g, inv.id, payload, errored)
+ 		}
+ 	}()
+ }
+@@ -272,7 +286,8 @@ func runHandler(t *testing.T, broker *runtimeBroker, fn string, respond func(inv
+ // in FIFO order, instead of the second vanishing.
+ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
+ 	d := newTestDispatcher(t)
+-	broker := newRuntimeBroker()
++	g := newTestGeneration(t, d, "fn")
++	broker := newRuntimeBroker(d.done)
+ 
+ 	var (
+ 		mu    sync.Mutex
+@@ -280,7 +295,7 @@ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
+ 		first = true
+ 	)
+ 
+-	runHandler(t, broker, "fn", func(inv *runtimeInvocation) ([]byte, bool) {
++	runHandler(t, broker, g, func(inv *runtimeInvocation) ([]byte, bool) {
+ 		if first {
+ 			first = false
+ 
+@@ -294,9 +309,9 @@ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
+ 		return inv.payload, false
+ 	})
+ 
+-	deliverer := &runtimeDeliverer{broker: broker, fn: "fn"}
+-	d.enqueue("fn", deliverer, []byte(`{"seq":1}`))
+-	d.enqueue("fn", deliverer, []byte(`{"seq":2}`))
++	deliverer := &runtimeDeliverer{broker: broker, g: g}
++	d.enqueue(g, deliverer, []byte(`{"seq":1}`))
++	d.enqueue(g, deliverer, []byte(`{"seq":2}`))
+ 
+ 	if !waitFor(t, 5*time.Second, func() bool {
+ 		mu.Lock()
+@@ -328,34 +343,26 @@ func TestAsyncDispatcher_RuntimeDeliveredWhileHandlerBusy(t *testing.T) {
+ // polling, instead of vanishing.
+ func TestAsyncDispatcher_RuntimeDeliveredAfterHandlerPollsLate(t *testing.T) {
+ 	d := newTestDispatcher(t)
+-	broker := newRuntimeBroker()
+-
+-	// Register the function (as broker.registered would report it) without
+-	// any goroutine blocked in next — mirrors a handler that polled once
+-	// before and is briefly not polling now.
+-	broker.get("fn")
+-
+-	if !broker.registered("fn") {
+-		t.Fatal("expected function to be registered")
+-	}
++	g := newTestGeneration(t, d, "fn")
++	broker := newRuntimeBroker(d.done)
+ 
+ 	received := make(chan []byte, 1)
+ 
+-	deliverer := &runtimeDeliverer{broker: broker, fn: "fn", waitTimeout: 20 * time.Millisecond}
+-	d.enqueue("fn", deliverer, []byte(`{"late":true}`))
++	deliverer := &runtimeDeliverer{broker: broker, g: g, waitTimeout: 20 * time.Millisecond}
++	d.enqueue(g, deliverer, []byte(`{"late":true}`))
+ 
+ 	// Let the deliverer's first wait (and at least one retry) time out
+ 	// before the handler starts polling.
+ 	time.Sleep(80 * time.Millisecond)
+ 
+ 	go func() {
+-		inv, err := broker.next(t.Context(), "fn")
++		inv, err := broker.next(t.Context(), g)
+ 		if err != nil {
+ 			return
+ 		}
+ 
+ 		received <- inv.payload
+-		broker.respond("fn", inv.id, inv.payload, false)
++		broker.respond(g, inv.id, inv.payload, false)
+ 	}()
+ 
+ 	select {
+@@ -374,14 +381,15 @@ func TestAsyncDispatcher_RuntimeDeliveredAfterHandlerPollsLate(t *testing.T) {
+ // the endpoint path's retry semantics.
+ func TestAsyncDispatcher_RuntimeFunctionErrorRetries(t *testing.T) {
+ 	d := newTestDispatcher(t)
+-	broker := newRuntimeBroker()
++	g := newTestGeneration(t, d, "fn")
++	broker := newRuntimeBroker(d.done)
+ 
+ 	var (
+ 		mu       sync.Mutex
+ 		attempts int
+ 	)
+ 
+-	runHandler(t, broker, "fn", func(inv *runtimeInvocation) ([]byte, bool) {
++	runHandler(t, broker, g, func(inv *runtimeInvocation) ([]byte, bool) {
+ 		mu.Lock()
+ 		attempts++
+ 		mu.Unlock()
+@@ -396,7 +404,7 @@ func TestAsyncDispatcher_RuntimeFunctionErrorRetries(t *testing.T) {
+ 		return attempts
+ 	}
+ 
+-	d.enqueue("fn", &runtimeDeliverer{broker: broker, fn: "fn"}, []byte(`{}`))
++	d.enqueue(g, &runtimeDeliverer{broker: broker, g: g}, []byte(`{}`))
+ 
+ 	wantAttempts := 1 + asyncMaxFunctionErrorRetries
+ 	if !waitFor(t, 5*time.Second, func() bool { return count() == wantAttempts }) {
+@@ -418,7 +426,8 @@ func TestAsyncDispatcher_RuntimeFunctionErrorRetries(t *testing.T) {
+ // async invocation semantics for a function timeout.
+ func TestAsyncDispatcher_RuntimeFunctionErrorOnResponseTimeout(t *testing.T) {
+ 	d := newTestDispatcher(t)
+-	broker := newRuntimeBroker()
++	g := newTestGeneration(t, d, "fn")
++	broker := newRuntimeBroker(d.done)
+ 
+ 	var (
+ 		mu       sync.Mutex
+@@ -432,7 +441,7 @@ func TestAsyncDispatcher_RuntimeFunctionErrorOnResponseTimeout(t *testing.T) {
+ 			// Poll and take the invocation, then never respond —
+ 			// simulates a handler whose function timed out after
+ 			// picking up the work.
+-			_, err := broker.next(ctx, "fn")
++			_, err := broker.next(ctx, g)
+ 			if err != nil {
+ 				return
+ 			}
+@@ -450,8 +459,8 @@ func TestAsyncDispatcher_RuntimeFunctionErrorOnResponseTimeout(t *testing.T) {
+ 		return attempts
+ 	}
+ 
+-	deliverer := &runtimeDeliverer{broker: broker, fn: "fn", waitTimeout: 20 * time.Millisecond}
+-	d.enqueue("fn", deliverer, []byte(`{}`))
++	deliverer := &runtimeDeliverer{broker: broker, g: g, waitTimeout: 20 * time.Millisecond}
++	d.enqueue(g, deliverer, []byte(`{}`))
+ 
+ 	wantAttempts := 1 + asyncMaxFunctionErrorRetries
+ 	if !waitFor(t, 5*time.Second, func() bool { return count() == wantAttempts }) {
+@@ -540,6 +549,9 @@ func newInvokeTestServiceMulti(t *testing.T, endpoints map[string]string) *Servi
+ 		}
+ 	}
+ 
++	// Storage was populated directly; create the matching live generations.
++	svc.restoreGenerations()
++
+ 	return svc
+ }
+ 
+diff --git a/internal/service/lambda/handlers.go b/internal/service/lambda/handlers.go
+index 6771392..b237b7e 100644
+--- a/internal/service/lambda/handlers.go
++++ b/internal/service/lambda/handlers.go
+@@ -40,7 +40,16 @@ func (s *Service) CreateFunction(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	fn, err := s.storage.CreateFunction(r.Context(), &req)
++	// Serialize against a concurrent DeleteFunction (and CreateFunction)
++	// for the same name so resource insertion and the fresh generation are
++	// committed as one step.
++	op := s.lifecycles.opLock(req.FunctionName)
++	op.Lock()
++	defer op.Unlock()
++
++	fn, _, err := s.lifecycles.create(req.FunctionName, func() (*Function, error) {
++		return s.storage.CreateFunction(r.Context(), &req)
++	})
+ 	if err != nil {
+ 		var lambdaErr *FunctionError
+ 		if errors.As(err, &lambdaErr) {
+@@ -133,6 +142,17 @@ func (s *Service) GetFunctionConfiguration(w http.ResponseWriter, r *http.Reques
+ }
+ 
+ // DeleteFunction handles the DeleteFunction API.
++//
++// Deletion is two-phased against the function's generation: first a
++// boundary is set that rejects new Invoke admissions and wakes idle
++// Runtime API long polls, then the call waits for every invocation admitted
++// before the boundary (synchronous and asynchronous, endpoint and runtime)
++// to finish. The storage resource is removed and the generation retired
++// only once that work has fully exited. If the drain cannot finish within
++// the request deadline, the boundary is rolled back and the request fails:
++// the function stays queryable and usable so the caller can restore the
++// execution target and retry. A same-name CreateFunction afterwards starts
++// a brand-new generation that inherits no queue, gate, payload or poller.
+ func (s *Service) DeleteFunction(w http.ResponseWriter, r *http.Request) {
+ 	functionName := extractFunctionName(r.URL.Path)
+ 	if functionName == "" {
+@@ -141,25 +161,61 @@ func (s *Service) DeleteFunction(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	err := s.storage.DeleteFunction(r.Context(), functionName)
+-	if err != nil {
+-		var lambdaErr *FunctionError
+-		if errors.As(err, &lambdaErr) {
+-			status := http.StatusBadRequest
+-			if lambdaErr.Type == ErrResourceNotFound {
+-				status = http.StatusNotFound
+-			}
++	// Serialize against CreateFunction and a concurrent DeleteFunction for
++	// the same name. This is a per-name lock: deleting one function never
++	// blocks operations on another.
++	op := s.lifecycles.opLock(functionName)
++	op.Lock()
++	defer op.Unlock()
+ 
+-			writeFunctionError(w, lambdaErr.Type, lambdaErr.Message, status)
++	if _, err := s.storage.GetFunction(r.Context(), functionName); err != nil {
++		handleGetFunctionError(w, err)
+ 
+-			return
+-		}
++		return
++	}
+ 
++	g := s.lifecycles.get(functionName)
++	if g == nil {
+ 		writeFunctionError(w, ErrServiceException, "Internal server error", http.StatusInternalServerError)
+ 
+ 		return
+ 	}
+ 
++	// Phase 1: establish the delete boundary. Invokes admitted after this
++	// point are rejected; queued and in-flight work keeps running.
++	g.beginDeletion()
++
++	// Wait for all pre-boundary work to end. The work itself is never
++	// interrupted here; a timeout means convergence was impossible within
++	// the request deadline.
++	if err := g.waitWork(r.Context()); err != nil {
++		// Roll the boundary back: the function remains queryable and fully
++		// usable, including its queued deliveries and pollers.
++		g.abortDeletion()
++
++		writeFunctionError(w, ErrResourceConflict,
++			fmt.Sprintf("Function %s could not be drained before the request deadline (%v); the function was retained and is still usable", functionName, err),
++			http.StatusConflict)
++
++		return
++	}
++
++	// Phase 2: the old generation has fully exited. Commit resource
++	// removal plus generation retirement first; only then release the
++	// (idle) drain goroutine. If the commit somehow fails the boundary is
++	// rolled back and the generation — drain included — is fully usable.
++	if err := s.lifecycles.retire(functionName, g, func() error {
++		return s.storage.DeleteFunction(r.Context(), functionName)
++	}); err != nil {
++		g.abortDeletion()
++
++		handleFunctionError(w, err)
++
++		return
++	}
++
++	g.stopDrainLoop()
++
+ 	w.WriteHeader(http.StatusNoContent)
+ }
+ 
+@@ -312,28 +368,63 @@ func (s *Service) Invoke(w http.ResponseWriter, r *http.Request) {
+ 
+ 	async := invocationType == "Event"
+ 
+-	// Resolution order: a handler polling the Runtime API wins, then a
+-	// configured InvokeEndpoint, otherwise there is nothing to execute.
++	g := s.lifecycles.get(functionName)
++	if g == nil {
++		writeFunctionError(w, ErrResourceNotFound, "Function not found: "+functionName, http.StatusNotFound)
++
++		return
++	}
++
++	// Synchronous invocations are admitted here: the work count is
++	// acquired (and thus visible to a concurrent DeleteFunction) before
++	// anything is dispatched, and released only when this handler returns.
++	// Asynchronous admissions happen atomically inside enqueue.
++	if !async {
++		if !g.admit() {
++			writeFunctionError(w, ErrResourceConflict,
++				"Function "+functionName+" is being deleted", http.StatusConflict)
++
++			return
++		}
++
++		defer g.workDone()
++	}
++
++	// Resolution order: a handler polling the Runtime API on THIS
++	// generation wins, then a configured InvokeEndpoint, otherwise there
++	// is nothing to execute.
+ 	switch {
+-	case s.broker.registered(functionName):
+-		s.invokeViaRuntime(w, r, functionName, payload, async)
++	case s.broker.registered(g):
++		s.invokeViaRuntime(w, r, g, payload, async)
+ 	case fn.InvokeEndpoint != "":
+-		s.invokeViaEndpoint(w, r, functionName, fn.InvokeEndpoint, payload, async)
++		s.invokeViaEndpoint(w, r, g, fn.InvokeEndpoint, payload, async)
+ 	default:
+-		s.invokeNoBackend(w, functionName, async)
++		s.invokeNoBackend(w, functionName, g, async)
+ 	}
+ }
+ 
++// writeFunctionDeleting rejects an invocation that reached a generation
++// whose delete boundary has already been set.
++func writeFunctionDeleting(w http.ResponseWriter, fn string) {
++	writeFunctionError(w, ErrResourceConflict,
++		"Function "+fn+" is being deleted", http.StatusConflict)
++}
++
+ // invokeViaRuntime dispatches to a handler connected through the Runtime API.
+-func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, fn string, payload []byte, async bool) {
++func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, g *functionGeneration, payload []byte, async bool) {
+ 	if async {
+-		s.async.enqueue(fn, &runtimeDeliverer{broker: s.broker, fn: fn}, payload)
++		if !s.async.enqueue(g, &runtimeDeliverer{broker: s.broker, g: g}, payload) {
++			writeFunctionDeleting(w, g.name)
++
++			return
++		}
++
+ 		writeInvokeAccepted(w)
+ 
+ 		return
+ 	}
+ 
+-	res, err := s.broker.invoke(r.Context(), fn, payload, runtimeInvokeTimeout)
++	res, err := s.broker.invoke(r.Context(), g, payload, runtimeInvokeTimeout)
+ 	if err != nil {
+ 		writeFunctionError(w, ErrServiceException, "runtime invocation failed: "+err.Error(), http.StatusBadGateway)
+ 
+@@ -353,28 +444,41 @@ func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, fn st
+ // invokeViaEndpoint forwards to a function's configured InvokeEndpoint.
+ // Async invocations are queued on the dispatcher so the 202 means "accepted
+ // for delivery": failed deliveries are retried instead of dropped. Both the
+-// async delivery attempt and the synchronous call below share the same
+-// per-function gate (asyncDispatcher.gate) so a single-concurrency endpoint,
+-// such as the Lambda RIE, never sees two overlapping requests (issue #859).
+-func (s *Service) invokeViaEndpoint(w http.ResponseWriter, r *http.Request, fn, endpoint string, payload []byte, async bool) {
+-	gate := s.async.gate(fn)
+-
++// async delivery attempt and the synchronous call below share the
++// generation's gate so a single-concurrency endpoint, such as the Lambda
++// RIE, never sees two overlapping requests (issue #859).
++func (s *Service) invokeViaEndpoint(w http.ResponseWriter, r *http.Request, g *functionGeneration, endpoint string, payload []byte, async bool) {
+ 	if async {
+-		s.async.enqueue(fn, &endpointDeliverer{client: s.async.client, endpoint: endpoint, gate: gate}, payload)
++		if !s.async.enqueue(g, &endpointDeliverer{client: s.async.client, endpoint: endpoint, gate: g.gate}, payload) {
++			writeFunctionDeleting(w, g.name)
++
++			return
++		}
++
+ 		writeInvokeAccepted(w)
+ 
+ 		return
+ 	}
+ 
+-	s.invokeSync(r.Context(), w, endpoint, payload, gate)
++	s.invokeSync(r.Context(), w, endpoint, payload, g.gate)
+ }
+ 
+ // invokeNoBackend handles a function with neither a Runtime API handler nor an
+ // InvokeEndpoint. Async invocations are accepted (and dropped); a
+ // RequestResponse invocation has nothing to execute and fails — kumo does not
+ // fabricate an echo response.
+-func (s *Service) invokeNoBackend(w http.ResponseWriter, fn string, async bool) {
++func (s *Service) invokeNoBackend(w http.ResponseWriter, fn string, g *functionGeneration, async bool) {
+ 	if async {
++		// Nothing is queued or executed, but the boundary still applies:
++		// an Event after it must not be reported as accepted.
++		if !g.admit() {
++			writeFunctionDeleting(w, fn)
++
++			return
++		}
++
++		g.workDone()
++
+ 		writeInvokeAccepted(w)
+ 
+ 		return
+diff --git a/internal/service/lambda/lifecycle.go b/internal/service/lambda/lifecycle.go
+new file mode 100644
+index 0000000..c2ff0a3
+--- /dev/null
++++ b/internal/service/lambda/lifecycle.go
+@@ -0,0 +1,295 @@
++package lambda
++
++import (
++	"context"
++	"sync"
++)
++
++// functionGeneration is one CreateFunction incarnation of a function name.
++// It binds every piece of per-function state that must share the function's
++// lifecycle: the resource in storage, the async event queue, the
++// InvokeEndpoint serialization gate, and the Runtime API poll/pending
++// state. DeleteFunction drains and retires a generation as a single unit;
++// a same-name CreateFunction afterwards always starts a fresh generation
++// that inherits none of the old queue, gate, payloads or pollers.
++type functionGeneration struct {
++	id   uint64
++	name string
++
++	// shutdown is closed when the whole service closes; long polls and
++	// deliveries select on it in addition to their own contexts.
++	shutdown <-chan struct{}
++
++	// admMu is the linearization point between DeleteFunction and Invoke
++	// admission. Delete flips deleting under it before waiting on inflight;
++	// every admitted invocation increments inflight under it. A 202 (or
++	// 200) is written only after that increment, so for every invocation
++	// either the admission is visible before the boundary (delete waits
++	// for it) or the boundary is visible first (admission rejects it) —
++	// never both. zeroWaiters are signaled once inflight reaches zero; the
++	// counter-based design (rather than a WaitGroup) stays correct when a
++	// timed-out delete is aborted and the generation is admitted to again.
++	admMu       sync.Mutex
++	deleting    bool
++	inflight    int
++	zeroWaiters []chan struct{}
++
++	// stopDrain is closed once, after work has reached zero, to release
++	// the generation's drain goroutine.
++	stopDrain chan struct{}
++
++	// gate serializes InvokeEndpoint HTTP calls (sync and async) for this
++	// generation. A recreated function gets a brand-new gate.
++	gate invokeGate
++
++	// queue is the FIFO channel consumed by the async dispatcher drain
++	// goroutine; it and drainStarted are created lazily on the first Event
++	// invocation, under admMu.
++	queue        chan *asyncEvent
++	drainStarted bool
++
++	// Runtime API state for this generation: an unbuffered handoff
++	// channel, response channels of in-flight invocations keyed by request
++	// id, and registered which becomes true the first time a handler polls
++	// next on THIS generation — an older generation's poller never counts.
++	rtMu        sync.Mutex
++	registered  bool
++	invocations chan *runtimeInvocation
++	pending     map[string]chan runtimeResult
++
++	// deleteCtx is canceled while a DeleteFunction call is draining this
++	// generation: it wakes idle RuntimeNext long polls and blocks new
++	// runtime handoffs. abortDeletion replaces it with a fresh context so
++	// the generation is fully usable again after a failed (timed-out)
++	// delete, without ever "uncanceling" a channel.
++	sigMu        sync.Mutex
++	deleteCtx    context.Context
++	deleteCancel context.CancelFunc
++}
++
++func newFunctionGeneration(id uint64, name string, shutdown <-chan struct{}) *functionGeneration {
++	deleteCtx, cancel := context.WithCancel(context.Background())
++
++	return &functionGeneration{
++		id:           id,
++		name:         name,
++		shutdown:     shutdown,
++		stopDrain:    make(chan struct{}),
++		gate:         newInvokeGate(),
++		invocations:  make(chan *runtimeInvocation),
++		pending:      make(map[string]chan runtimeResult),
++		deleteCtx:    deleteCtx,
++		deleteCancel: cancel,
++	}
++}
++
++// admit registers one unit of in-flight work against the generation. It
++// returns false once a DeleteFunction drain has started, in which case the
++// caller must not touch the generation's queue, gate or runtime state.
++func (g *functionGeneration) admit() bool {
++	g.admMu.Lock()
++	defer g.admMu.Unlock()
++
++	if g.deleting {
++		return false
++	}
++
++	g.inflight++
++
++	return true
++}
++
++// workDone releases one unit of admitted work. If this brings the count to
++// zero, every pending drain wait is signaled exactly once.
++func (g *functionGeneration) workDone() {
++	g.admMu.Lock()
++	defer g.admMu.Unlock()
++
++	g.inflight--
++
++	if g.inflight < 0 {
++		panic("lambda: functionGeneration inflight counter went negative")
++	}
++
++	if g.inflight == 0 && len(g.zeroWaiters) > 0 {
++		for _, ch := range g.zeroWaiters {
++			close(ch)
++		}
++
++		g.zeroWaiters = nil
++	}
++}
++
++// beginDeletion establishes the delete boundary: subsequent admissions
++// fail, queued deliveries keep draining, and idle RuntimeNext polls are
++// woken through the delete signal.
++func (g *functionGeneration) beginDeletion() {
++	g.admMu.Lock()
++	g.deleting = true
++	g.admMu.Unlock()
++
++	g.sigMu.Lock()
++	g.deleteCancel()
++	g.sigMu.Unlock()
++}
++
++// abortDeletion rolls back the boundary when the drain cannot finish in
++// the request deadline. The function stays queryable and usable; in-flight
++// deliveries were never interrupted.
++func (g *functionGeneration) abortDeletion() {
++	ctx, cancel := context.WithCancel(context.Background())
++
++	g.sigMu.Lock()
++	g.deleteCtx = ctx
++	g.deleteCancel = cancel
++	g.sigMu.Unlock()
++
++	g.admMu.Lock()
++	g.deleting = false
++	g.admMu.Unlock()
++}
++
++// deletionSignal returns the channel closed while a delete is draining
++// this generation.
++func (g *functionGeneration) deletionSignal() <-chan struct{} {
++	g.sigMu.Lock()
++	defer g.sigMu.Unlock()
++
++	return g.deleteCtx.Done()
++}
++
++// waitWork blocks until every admitted invocation has finished or until
++// ctx expires. It never interrupts the work itself: on timeout the caller
++// aborts the boundary and the function keeps running. A timeout does not
++// leak a waiter that would conflict with later admissions — the registered
++// channel simply fires (harmlessly) the next time the count reaches zero.
++func (g *functionGeneration) waitWork(ctx context.Context) error {
++	zero := make(chan struct{})
++
++	g.admMu.Lock()
++	if g.inflight == 0 {
++		g.admMu.Unlock()
++
++		return nil
++	}
++
++	g.zeroWaiters = append(g.zeroWaiters, zero)
++	g.admMu.Unlock()
++
++	select {
++	case <-zero:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// stopDrainLoop releases the generation's drain goroutine after waitWork
++// has returned successfully.
++func (g *functionGeneration) stopDrainLoop() {
++	close(g.stopDrain)
++}
++
++// lifecycleRegistry owns the live function generations keyed by function
++// name and the per-name mutexes that serialize Create/Delete operations.
++// All map access is short; no wait ever happens while mu is held.
++type lifecycleRegistry struct {
++	mu       sync.Mutex
++	gens     map[string]*functionGeneration
++	opLocks  map[string]*sync.Mutex
++	nextID   uint64
++	shutdown <-chan struct{}
++}
++
++func newLifecycleRegistry(shutdown <-chan struct{}) *lifecycleRegistry {
++	return &lifecycleRegistry{
++		gens:     make(map[string]*functionGeneration),
++		opLocks:  make(map[string]*sync.Mutex),
++		shutdown: shutdown,
++	}
++}
++
++// opLock returns the mutex serializing CreateFunction and DeleteFunction
++// for one name. Distinct names get distinct mutexes, so a draining delete
++// on one function never blocks operations on another.
++func (r *lifecycleRegistry) opLock(name string) *sync.Mutex {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	m := r.opLocks[name]
++	if m == nil {
++		m = &sync.Mutex{}
++		r.opLocks[name] = m
++	}
++
++	return m
++}
++
++// create inserts the resource through commit and, on success, the fresh
++// generation in the same critical section. The lock order is
++// registry.mu -> storage.mu everywhere.
++func (r *lifecycleRegistry) create(name string, commit func() (*Function, error)) (*Function, *functionGeneration, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	fn, err := commit()
++	if err != nil {
++		return nil, nil, err
++	}
++
++	r.nextID++
++	g := newFunctionGeneration(r.nextID, name, r.shutdown)
++	r.gens[name] = g
++
++	return fn, g, nil
++}
++
++// bootstrap creates generations for functions already present in storage
++// (e.g. restored from a persistence snapshot at startup).
++func (r *lifecycleRegistry) bootstrap(names []string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	for _, name := range names {
++		if _, ok := r.gens[name]; ok {
++			continue
++		}
++
++		r.nextID++
++		r.gens[name] = newFunctionGeneration(r.nextID, name, r.shutdown)
++	}
++}
++
++// get returns the current generation for name, or nil if no live function
++// generation exists.
++func (r *lifecycleRegistry) get(name string) *functionGeneration {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	return r.gens[name]
++}
++
++// retire removes the generation and commits the storage deletion in one
++// critical section, after the caller has fully drained it. The opLock
++// entry is removed as well; the mutex itself stays valid for any caller
++// still holding it.
++func (r *lifecycleRegistry) retire(name string, g *functionGeneration, commit func() error) error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	if current := r.gens[name]; current != g {
++		return &FunctionError{
++			Type:    ErrServiceException,
++			Message: "function generation changed while deleting: " + name,
++		}
++	}
++
++	if err := commit(); err != nil {
++		return err
++	}
++
++	delete(r.gens, name)
++	delete(r.opLocks, name)
++
++	return nil
++}
+diff --git a/internal/service/lambda/lifecycle_test.go b/internal/service/lambda/lifecycle_test.go
+new file mode 100644
+index 0000000..b92c5c3
+--- /dev/null
++++ b/internal/service/lambda/lifecycle_test.go
+@@ -0,0 +1,847 @@
++package lambda
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// ---- test scaffolding -----------------------------------------------------
++
++// newLifecycleTestService returns a Service whose functions are created
++// through the CreateFunction handler so live generations always exist.
++func newLifecycleTestService(t *testing.T) *Service {
++	t.Helper()
++
++	svc := New(NewMemoryStorage(defaultBaseURL), defaultBaseURL)
++
++	t.Cleanup(func() {
++		if err := svc.Close(); err != nil {
++			t.Fatalf("close service: %v", err)
++		}
++	})
++
++	return svc
++}
++
++func createFunctionHTTP(t *testing.T, svc *Service, name, endpoint string) {
++	t.Helper()
++
++	body, err := json.Marshal(&CreateFunctionRequest{
++		FunctionName:   name,
++		Role:           "arn:aws:iam::000000000000:role/test",
++		InvokeEndpoint: endpoint,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	req := httptest.NewRequest(http.MethodPost, "/2015-03-31/functions", bytes.NewReader(body))
++	rec := httptest.NewRecorder()
++
++	svc.CreateFunction(rec, req)
++
++	if rec.Code != http.StatusCreated {
++		t.Fatalf("CreateFunction %s: status %d, body %s", name, rec.Code, rec.Body.String())
++	}
++}
++
++func deleteFunctionHTTP(ctx context.Context, svc *Service, name string) *httptest.ResponseRecorder {
++	req := httptest.NewRequestWithContext(ctx, http.MethodDelete,
++		"/2015-03-31/functions/"+name, http.NoBody)
++	rec := httptest.NewRecorder()
++
++	svc.DeleteFunction(rec, req)
++
++	return rec
++}
++
++func invokeHTTP(svc *Service, fn, invocationType string, payload []byte) *httptest.ResponseRecorder {
++	path := "/2015-03-31/functions/" + fn + "/invocations"
++	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
++
++	if invocationType != "" {
++		req.Header.Set("X-Amz-Invocation-Type", invocationType)
++	}
++
++	rec := httptest.NewRecorder()
++	svc.Invoke(rec, req)
++
++	return rec
++}
++
++func getFunctionHTTP(svc *Service, name string) *httptest.ResponseRecorder {
++	req := httptest.NewRequest(http.MethodGet, "/2015-03-31/functions/"+name, http.NoBody)
++	rec := httptest.NewRecorder()
++
++	svc.GetFunction(rec, req)
++
++	return rec
++}
++
++func runtimeNextRequest(ctx context.Context, fn string) *http.Request {
++	return httptest.NewRequestWithContext(ctx, http.MethodGet,
++		"/_runtime/"+fn+"/2018-06-01/runtime/invocation/next", http.NoBody)
++}
++
++func runtimeResponseRequest(fn, id string, body []byte) *http.Request {
++	return httptest.NewRequest(http.MethodPost,
++		"/_runtime/"+fn+"/2018-06-01/runtime/invocation/"+id+"/response",
++		bytes.NewReader(body))
++}
++
++// barrierServer is an InvokeEndpoint stand-in that records every request,
++// signals request once per call, and either sleeps latency or blocks until
++// releaseAll is called.
++type barrierServer struct {
++	*httptest.Server
++	request  chan struct{}
++	release  chan struct{}
++	count    atomic.Int32
++	mu       sync.Mutex
++	payloads []string
++}
++
++func newBarrierServer(t *testing.T) *barrierServer {
++	t.Helper()
++
++	return newControlledServer(t, 0, true)
++}
++
++func newLatencyServer(t *testing.T, latency time.Duration) *barrierServer {
++	t.Helper()
++
++	return newControlledServer(t, latency, false)
++}
++
++func newControlledServer(t *testing.T, latency time.Duration, block bool) *barrierServer {
++	b := &barrierServer{
++		request: make(chan struct{}, 128),
++		release: make(chan struct{}),
++	}
++
++	b.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++
++		b.mu.Lock()
++		b.payloads = append(b.payloads, string(body))
++		b.mu.Unlock()
++
++		b.count.Add(1)
++		b.request <- struct{}{}
++
++		if latency > 0 {
++			time.Sleep(latency)
++		}
++
++		if block {
++			<-b.release
++		}
++
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte(`{}`))
++	}))
++
++	t.Cleanup(b.Server.Close)
++
++	return b
++}
++
++func (b *barrierServer) releaseAll() {
++	close(b.release)
++}
++
++func (b *barrierServer) requests() int32 { return b.count.Load() }
++
++func (b *barrierServer) payloadsSnapshot() []string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	return append([]string(nil), b.payloads...)
++}
++
++// waitRequests blocks until n requests have hit the endpoint.
++func (b *barrierServer) waitRequests(t *testing.T, n int) {
++	t.Helper()
++
++	for range n {
++		select {
++		case <-b.request:
++		case <-time.After(5 * time.Second):
++			t.Fatalf("endpoint: expected %d requests, got %d", n, b.count.Load())
++		}
++	}
++}
++
++// deleteAsync runs DeleteFunction in a goroutine and returns the recorder
++// channel.
++func deleteAsync(t *testing.T, svc *Service, name string, timeout time.Duration) <-chan *httptest.ResponseRecorder {
++	t.Helper()
++
++	out := make(chan *httptest.ResponseRecorder, 1)
++
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), timeout)
++		defer cancel()
++
++		out <- deleteFunctionHTTP(ctx, svc, name)
++	}()
++
++	return out
++}
++
++// ---- tests ---------------------------------------------------------------
++
++// TestDeleteFunction_DrainsAsyncEventsBefore204 verifies the core quiesce
++// guarantee: every Event invocation that got a 202 before the delete
++// boundary is delivered before DeleteFunction returns 204, and after the
++// 204 no old request reaches the endpoint and the function is gone.
++func TestDeleteFunction_DrainsAsyncEventsBefore204(t *testing.T) {
++	svc := newLifecycleTestService(t)
++
++	srv := newLatencyServer(t, 20*time.Millisecond)
++	createFunctionHTTP(t, svc, "fn", srv.URL)
++
++	for i := 1; i <= 3; i++ {
++		rec := invokeHTTP(svc, "fn", "Event", []byte(fmt.Sprintf(`{"seq":%d}`, i)))
++		if rec.Code != http.StatusAccepted {
++			t.Fatalf("event invoke %d: status %d", i, rec.Code)
++		}
++	}
++
++	srv.waitRequests(t, 3)
++
++	rec := deleteFunctionHTTP(context.Background(), svc, "fn")
++	if rec.Code != http.StatusNoContent {
++		t.Fatalf("delete status = %d, want 204, body %s", rec.Code, rec.Body.String())
++	}
++
++	// No further requests must ever reach the old endpoint.
++	time.Sleep(150 * time.Millisecond)
++
++	if got := srv.requests(); got != 3 {
++		t.Fatalf("endpoint got %d requests after delete, want exactly 3", got)
++	}
++
++	got := srv.payloadsSnapshot()
++	want := []string{`{"seq":1}`, `{"seq":2}`, `{"seq":3}`}
++
++	if len(got) != len(want) {
++		t.Fatalf("deliveries = %v, want %v", got, want)
++	}
++
++	for i := range want {
++		if got[i] != want[i] {
++			t.Errorf("delivery %d = %s, want %s", i, got[i], want[i])
++		}
++	}
++
++	// Generation retired and function gone.
++	if g := svc.lifecycles.get("fn"); g != nil {
++		t.Errorf("generation still registered after 204")
++	}
++
++	if rec := getFunctionHTTP(svc, "fn"); rec.Code != http.StatusNotFound {
++		t.Errorf("GetFunction after delete = %d, want 404", rec.Code)
++	}
++
++	if rec := invokeHTTP(svc, "fn", "Event", []byte(`{}`)); rec.Code != http.StatusNotFound {
++		t.Errorf("Invoke after delete = %d, want 404", rec.Code)
++	}
++}
++
++// TestDeleteFunction_WaitsForInFlightSyncInvoke verifies that a 204 is not
++// returned while a synchronous endpoint delivery is still in flight, and
++// that invocations admitted after the boundary are rejected and never
++// delivered.
++func TestDeleteFunction_WaitsForInFlightSyncInvoke(t *testing.T) {
++	svc := newLifecycleTestService(t)
++
++	srv := newBarrierServer(t)
++	createFunctionHTTP(t, svc, "fn", srv.URL)
++
++	syncDone := make(chan *httptest.ResponseRecorder, 1)
++
++	go func() {
++		syncDone <- invokeHTTP(svc, "fn", "RequestResponse", []byte(`{"sync":1}`))
++	}()
++
++	srv.waitRequests(t, 1)
++
++	del := deleteAsync(t, svc, "fn", 5*time.Second)
++
++	// Delete must not complete while the sync call is in flight.
++	select {
++	case rec := <-del:
++		t.Fatalf("delete returned %d while sync invoke in flight", rec.Code)
++	case <-time.After(150 * time.Millisecond):
++	}
++
++	// Once the boundary is visible, both async and sync invokes must be
++	// rejected; none of them may reach the endpoint.
++	acceptedAfterBoundary := 0
++
++	if !waitFor(t, 2*time.Second, func() bool {
++		return invokeHTTP(svc, "fn", "Event", []byte(`{"late":1}`)).Code == http.StatusConflict
++	}) {
++		t.Fatal("post-boundary Event invoke was never rejected")
++	}
++
++	for range 5 {
++		if rec := invokeHTTP(svc, "fn", "Event", []byte(`{"late":1}`)); rec.Code == http.StatusAccepted {
++			acceptedAfterBoundary++
++		}
++
++		if rec := invokeHTTP(svc, "fn", "", []byte(`{"late":1}`)); rec.Code != http.StatusConflict {
++			t.Errorf("post-boundary sync invoke = %d, want 409", rec.Code)
++		}
++	}
++
++	if acceptedAfterBoundary != 0 {
++		t.Errorf("%d post-boundary events accepted, want 0", acceptedAfterBoundary)
++	}
++
++	// Release the in-flight sync invoke; delete now converges.
++	srv.releaseAll()
++
++	var delRec *httptest.ResponseRecorder
++
++	select {
++	case delRec = <-del:
++	case <-time.After(5 * time.Second):
++		t.Fatal("delete did not complete after in-flight invoke finished")
++	}
++
++	if delRec.Code != http.StatusNoContent {
++		t.Fatalf("delete = %d, want 204, body %s", delRec.Code, delRec.Body.String())
++	}
++
++	select {
++	case rec := <-syncDone:
++		if rec.Code != http.StatusOK {
++			t.Errorf("sync invoke = %d, want 200", rec.Code)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("sync invoke never completed")
++	}
++
++	// Exactly the single pre-boundary delivery reached the endpoint.
++	time.Sleep(100 * time.Millisecond)
++
++	if got := srv.requests(); got != 1 {
++		t.Fatalf("endpoint got %d requests, want exactly the 1 admitted sync invoke", got)
++	}
++}
++
++// TestDeleteFunction_TimeoutRetainsFunction verifies that a delete that
++// cannot converge within the request deadline fails, rolls the boundary
++// back, and leaves the function queryable and usable; a later delete then
++// succeeds.
++func TestDeleteFunction_TimeoutRetainsFunction(t *testing.T) {
++	svc := newLifecycleTestService(t)
++
++	srv := newBarrierServer(t)
++	createFunctionHTTP(t, svc, "fn", srv.URL)
++
++	// A sync invoke wedged for the whole delete deadline.
++	syncDone := make(chan *httptest.ResponseRecorder, 1)
++
++	go func() {
++		syncDone <- invokeHTTP(svc, "fn", "RequestResponse", []byte(`{}`))
++	}()
++
++	srv.waitRequests(t, 1)
++
++	// An event queued behind the wedged sync invoke (gate serialization).
++	if rec := invokeHTTP(svc, "fn", "Event", []byte(`{"queued":1}`)); rec.Code != http.StatusAccepted {
++		t.Fatalf("queued event = %d, want 202", rec.Code)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
++	defer cancel()
++
++	rec := deleteFunctionHTTP(ctx, svc, "fn")
++	if rec.Code != http.StatusConflict {
++		t.Fatalf("timed-out delete = %d, want 409, body %s", rec.Code, rec.Body.String())
++	}
++
++	// Function remains queryable.
++	if rec := getFunctionHTTP(svc, "fn"); rec.Code != http.StatusOK {
++		t.Errorf("GetFunction after failed delete = %d, want 200", rec.Code)
++	}
++
++	// Release the wedged endpoint: the sync invoke finishes and the queued
++	// event drains — the rolled-back generation's queue and gate are still
++	// live.
++	srv.releaseAll()
++
++	select {
++	case syncRec := <-syncDone:
++		if syncRec.Code != http.StatusOK {
++			t.Errorf("wedged sync invoke = %d, want 200", syncRec.Code)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("wedged sync invoke never completed after release")
++	}
++
++	srv.waitRequests(t, 1) // the queued event lands
++
++	// New work is accepted and executed on the retained generation.
++	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte(`{}`))
++	}))
++	defer fast.Close()
++
++	// The retained function still points at the (now unblocked) original
++	// endpoint; a sync invoke must succeed.
++	if rec := invokeHTTP(svc, "fn", "RequestResponse", []byte(`{}`)); rec.Code != http.StatusOK {
++		t.Errorf("retained function sync invoke = %d, want 200, body %s", rec.Code, rec.Body.String())
++	}
++
++	// Retry the delete with enough time: it now converges and commits.
++	if rec := deleteFunctionHTTP(context.Background(), svc, "fn"); rec.Code != http.StatusNoContent {
++		t.Fatalf("retry delete = %d, want 204, body %s", rec.Code, rec.Body.String())
++	}
++}
++
++// TestDeleteFunction_WakesRuntimeNextPoll verifies that an idle Runtime
++// API long poll is woken with the same stable error when the function is
++// deleted, and stays rejected once the generation is gone.
++func TestDeleteFunction_WakesRuntimeNextPoll(t *testing.T) {
++	svc := newLifecycleTestService(t)
++	createFunctionHTTP(t, svc, "fn", "")
++
++	polled := make(chan *httptest.ResponseRecorder, 1)
++
++	go func() {
++		rec := httptest.NewRecorder()
++		svc.RuntimeNext(rec, runtimeNextRequest(context.Background(), "fn"))
++		polled <- rec
++	}()
++
++	// Wait until the long poll is parked.
++	time.Sleep(100 * time.Millisecond)
++
++	if rec := deleteFunctionHTTP(context.Background(), svc, "fn"); rec.Code != http.StatusNoContent {
++		t.Fatalf("delete = %d, want 204", rec.Code)
++	}
++
++	select {
++	case rec := <-polled:
++		if rec.Code != http.StatusGone {
++			t.Fatalf("RuntimeNext after delete = %d, want 410, body %s", rec.Code, rec.Body.String())
++		}
++
++		var body map[string]string
++		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
++			t.Fatalf("gone response body: %v", err)
++		}
++
++		if body["errorType"] != "Runtime.FunctionDeleted" {
++			t.Errorf("errorType = %q, want Runtime.FunctionDeleted", body["errorType"])
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("RuntimeNext long poll was not woken by delete")
++	}
++
++	// Stable error on subsequent polls too — no hanging, no recreated state.
++	rec := httptest.NewRecorder()
++	svc.RuntimeNext(rec, runtimeNextRequest(context.Background(), "fn"))
++
++	if rec.Code != http.StatusGone {
++		t.Errorf("RuntimeNext after retirement = %d, want 410", rec.Code)
++	}
++}
++
++// TestDeleteFunction_InFlightRuntimeResponseCompletes verifies that an
++// invocation already handed to a runtime handler can still respond while
++// the delete is draining, and that the same request id posted after a
++// same-name recreate is rejected instead of reaching the new generation.
++func TestDeleteFunction_InFlightRuntimeResponseCompletes(t *testing.T) {
++	svc := newLifecycleTestService(t)
++	createFunctionHTTP(t, svc, "fn", "")
++
++	oldGen := svc.lifecycles.get("fn")
++
++	// Scripted poller: take one invocation, report its id, then respond on
++	// demand.
++	nextRec := make(chan *httptest.ResponseRecorder, 1)
++
++	go func() {
++		rec := httptest.NewRecorder()
++		svc.RuntimeNext(rec, runtimeNextRequest(context.Background(), "fn"))
++		nextRec <- rec
++	}()
++
++	// Wait for the poll to register.
++	if !waitFor(t, 2*time.Second, func() bool {
++		return svc.broker.registered(oldGen)
++	}) {
++		t.Fatal("handler never registered")
++	}
++
++	syncDone := make(chan *httptest.ResponseRecorder, 1)
++
++	go func() {
++		syncDone <- invokeHTTP(svc, "fn", "RequestResponse", []byte(`{"old":true}`))
++	}()
++
++	var id string
++
++	select {
++	case rec := <-nextRec:
++		if rec.Code != http.StatusOK {
++			t.Fatalf("next = %d, want 200, body %s", rec.Code, rec.Body.String())
++		}
++
++		id = rec.Header().Get("Lambda-Runtime-Aws-Request-Id")
++		if id == "" {
++			t.Fatal("missing request id header")
++		}
++
++		if rec.Body.String() != `{"old":true}` {
++			t.Errorf("handoff payload = %s", rec.Body.String())
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("invocation never reached the poller")
++	}
++
++	del := deleteAsync(t, svc, "fn", 5*time.Second)
++
++	// Delete must wait for the handler's response.
++	select {
++	case rec := <-del:
++		t.Fatalf("delete returned %d while runtime invocation unresponded", rec.Code)
++	case <-time.After(150 * time.Millisecond):
++	}
++
++	// The handler responds: accepted, and it unblocks both the invoke and
++	// the delete.
++	respRec := httptest.NewRecorder()
++	svc.RuntimeResponse(respRec, runtimeResponseRequest("fn", id, []byte(`{"result":"ok"}`)))
++
++	if respRec.Code != http.StatusAccepted {
++		t.Fatalf("in-flight response = %d, want 202, body %s", respRec.Code, respRec.Body.String())
++	}
++
++	select {
++	case rec := <-syncDone:
++		if rec.Code != http.StatusOK || rec.Body.String() != `{"result":"ok"}` {
++			t.Fatalf("sync invoke = %d body %s, want 200 with result", rec.Code, rec.Body.String())
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("sync invoke did not complete after response")
++	}
++
++	select {
++	case rec := <-del:
++		if rec.Code != http.StatusNoContent {
++			t.Fatalf("delete = %d, want 204", rec.Code)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("delete did not complete after the in-flight response")
++	}
++
++	// Recreate the function under the same name: brand-new generation.
++	createFunctionHTTP(t, svc, "fn", "")
++
++	newGen := svc.lifecycles.get("fn")
++	if newGen == nil || newGen == oldGen {
++		t.Fatal("same-name CreateFunction did not produce a distinct generation")
++	}
++
++	if newGen.gate == oldGen.gate {
++		t.Error("new generation inherited the old gate")
++	}
++
++	if svc.broker.registered(newGen) {
++		t.Error("new generation inherited the old runtime poller registration")
++	}
++
++	// The late response for the old request id must not land in the new
++	// generation's pending state.
++	late := httptest.NewRecorder()
++	svc.RuntimeResponse(late, runtimeResponseRequest("fn", id, []byte(`{"evil":true}`)))
++
++	if late.Code != http.StatusForbidden {
++		t.Fatalf("late response into new generation = %d, want 403, body %s", late.Code, late.Body.String())
++	}
++
++	newGen.rtMu.Lock()
++	pendingCount := len(newGen.pending)
++	newGen.rtMu.Unlock()
++
++	if pendingCount != 0 {
++		t.Errorf("new generation has %d pending entries inherited from the old generation", pendingCount)
++	}
++}
++
++// TestCreateFunction_SameNameIsFreshGeneration verifies that a function
++// recreated after delete uses only its new endpoint and none of the old
++// generation's runtime state, and that the old endpoint receives nothing.
++func TestCreateFunction_SameNameIsFreshGeneration(t *testing.T) {
++	svc := newLifecycleTestService(t)
++
++	var deleted atomic.Bool
++
++	oldEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++
++		if deleted.Load() {
++			t.Errorf("old endpoint received a request after delete committed: %s", body)
++		}
++
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write(body)
++	}))
++
++	newEndpointCalls := make(chan []byte, 8)
++	newEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++		newEndpointCalls <- body
++		w.WriteHeader(http.StatusOK)
++	}))
++
++	defer oldEndpoint.Close()
++	defer newEndpoint.Close()
++
++	createFunctionHTTP(t, svc, "fn", oldEndpoint.URL)
++	oldGen := svc.lifecycles.get("fn")
++
++	if rec := invokeHTTP(svc, "fn", "Event", []byte(`{"gen":"old"}`)); rec.Code != http.StatusAccepted {
++		t.Fatalf("old event = %d", rec.Code)
++	}
++
++	if rec := deleteFunctionHTTP(context.Background(), svc, "fn"); rec.Code != http.StatusNoContent {
++		t.Fatalf("delete = %d", rec.Code)
++	}
++
++	deleted.Store(true)
++
++	createFunctionHTTP(t, svc, "fn", newEndpoint.URL)
++	newGen := svc.lifecycles.get("fn")
++
++	if newGen == oldGen {
++		t.Fatal("new generation is the same object as the old one")
++	}
++
++	if newGen.gate == oldGen.gate {
++		t.Error("new generation inherited the old gate")
++	}
++
++	if newGen.queue != nil {
++		t.Error("new generation inherited the old async queue")
++	}
++
++	if rec := invokeHTTP(svc, "fn", "Event", []byte(`{"gen":"new"}`)); rec.Code != http.StatusAccepted {
++		t.Fatalf("new event = %d, want 202", rec.Code)
++	}
++
++	select {
++	case body := <-newEndpointCalls:
++		if string(body) != `{"gen":"new"}` {
++			t.Errorf("new endpoint got %s, want new payload", body)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("new endpoint never received the event")
++	}
++}
++
++// TestDeleteFunction_OtherFunctionsUnaffected verifies that one function
++// stuck draining neither blocks invokes/deletes on other functions nor
++// creates for new names.
++func TestDeleteFunction_OtherFunctionsUnaffected(t *testing.T) {
++	svc := newLifecycleTestService(t)
++
++	srvA := newBarrierServer(t)
++	srvB := newLatencyServer(t, 10*time.Millisecond)
++
++	createFunctionHTTP(t, svc, "fn-a", srvA.URL)
++	createFunctionHTTP(t, svc, "fn-b", srvB.URL)
++
++	// Wedge fn-a with an in-flight sync invoke.
++	go func() { invokeHTTP(svc, "fn-a", "RequestResponse", []byte(`{}`)) }()
++	srvA.waitRequests(t, 1)
++
++	delA := deleteAsync(t, svc, "fn-a", 200*time.Millisecond)
++
++	// fn-b stays fully operational: events delivered, delete commits.
++	if rec := invokeHTTP(svc, "fn-b", "Event", []byte(`{"b":1}`)); rec.Code != http.StatusAccepted {
++		t.Fatalf("fn-b event while fn-a draining = %d, want 202", rec.Code)
++	}
++
++	srvB.waitRequests(t, 1)
++
++	createFunctionHTTP(t, svc, "fn-c", srvB.URL)
++
++	if rec := deleteFunctionHTTP(context.Background(), svc, "fn-b"); rec.Code != http.StatusNoContent {
++		t.Fatalf("delete fn-b while fn-a draining = %d, want 204, body %s", rec.Code, rec.Body.String())
++	}
++
++	// fn-a's delete times out and retains the function.
++	select {
++	case rec := <-delA:
++		if rec.Code != http.StatusConflict {
++			t.Fatalf("delete fn-a = %d, want 409", rec.Code)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("delete fn-a never returned")
++	}
++
++	if rec := getFunctionHTTP(svc, "fn-a"); rec.Code != http.StatusOK {
++		t.Errorf("fn-a GetFunction = %d, want 200", rec.Code)
++	}
++
++	if rec := getFunctionHTTP(svc, "fn-b"); rec.Code != http.StatusNotFound {
++		t.Errorf("fn-b GetFunction = %d, want 404", rec.Code)
++	}
++
++	if rec := getFunctionHTTP(svc, "fn-c"); rec.Code != http.StatusOK {
++		t.Errorf("fn-c GetFunction = %d, want 200", rec.Code)
++	}
++
++	// Unblock fn-a; it remains usable and can be deleted on retry.
++	srvA.releaseAll()
++
++	if rec := deleteFunctionHTTP(context.Background(), svc, "fn-a"); rec.Code != http.StatusNoContent {
++		t.Fatalf("retry delete fn-a = %d, want 204", rec.Code)
++	}
++}
++
++// TestDeleteFunction_ConcurrentInvokeOrdering is the deterministic ordering
++// stress test: with one in-flight invoke and a batch of queued events,
++// DeleteFunction commits only after every pre-boundary 202 is delivered;
++// every post-boundary invoke is rejected and never hits the endpoint.
++func TestDeleteFunction_ConcurrentInvokeOrdering(t *testing.T) {
++	svc := newLifecycleTestService(t)
++
++	srv := newBarrierServer(t)
++	createFunctionHTTP(t, svc, "fn", srv.URL)
++
++	// One in-flight sync invoke (holds the per-generation gate).
++	go func() { invokeHTTP(svc, "fn", "RequestResponse", []byte(`{"sync":1}`)) }()
++	srv.waitRequests(t, 1)
++
++	// Ten events admitted before the boundary; they queue behind the gate.
++	for range 10 {
++		if rec := invokeHTTP(svc, "fn", "Event", []byte(`{"pre":1}`)); rec.Code != http.StatusAccepted {
++			t.Fatalf("pre-boundary event = %d, want 202", rec.Code)
++		}
++	}
++
++	del := deleteAsync(t, svc, "fn", 10*time.Second)
++
++	// Probe until the boundary is observable. Probes that slip in before
++	// the boundary (202) are themselves admitted work and must be drained,
++	// so count them.
++	var probeAccepted atomic.Int32
++
++	if !waitFor(t, 2*time.Second, func() bool {
++		rec := invokeHTTP(svc, "fn", "Event", []byte(`{"probe":1}`))
++		if rec.Code == http.StatusAccepted {
++			probeAccepted.Add(1)
++
++			return false
++		}
++
++		return rec.Code == http.StatusConflict
++	}) {
++		t.Fatal("delete boundary never became visible")
++	}
++
++	// A burst of post-boundary invokes: none accepted.
++	var wg sync.WaitGroup
++
++	var rejected atomic.Int32
++
++	for range 20 {
++		wg.Add(1)
++
++		go func() {
++			defer wg.Done()
++
++			if invokeHTTP(svc, "fn", "Event", []byte(`{"post":1}`)).Code == http.StatusConflict {
++				rejected.Add(1)
++			}
++		}()
++	}
++
++	wg.Wait()
++
++	if got := rejected.Load(); got != 20 {
++		t.Errorf("post-boundary rejected = %d, want 20", got)
++	}
++
++	// Release everything: 1 sync + 10 queued events + any probes admitted
++	// before the boundary must finish, then 204.
++	srv.releaseAll()
++
++	select {
++	case rec := <-del:
++		if rec.Code != http.StatusNoContent {
++			t.Fatalf("delete = %d, want 204, body %s", rec.Code, rec.Body.String())
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("delete never converged")
++	}
++
++	time.Sleep(100 * time.Millisecond)
++
++	wantDeliveries := int32(11) + probeAccepted.Load()
++	if got := srv.requests(); got != wantDeliveries {
++		t.Fatalf("endpoint got %d requests, want exactly %d (1 sync + 10 events + %d pre-boundary probes)",
++			got, wantDeliveries, probeAccepted.Load())
++	}
++}
++
++// TestServiceClose_DrainsGenerationsWithoutHang verifies the service-wide
++// shutdown semantics remain compatible: queued deliveries are aborted and
++// Close returns even while a function has retrying events.
++func TestServiceClose_DrainsGenerationsWithoutHang(t *testing.T) {
++	svc := New(NewMemoryStorage(defaultBaseURL), defaultBaseURL)
++
++	addr := reserveAddr(t)
++	_, g, err := svc.lifecycles.create("fn", func() (*Function, error) {
++		return svc.storage.CreateFunction(context.Background(), &CreateFunctionRequest{
++			FunctionName:   "fn",
++			Role:           "arn:aws:iam::000000000000:role/test",
++			InvokeEndpoint: "http://" + addr + "/invoke",
++		})
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	svc.async.initialBackoff = 5 * time.Millisecond
++	svc.async.maxBackoff = 20 * time.Millisecond
++
++	for range 3 {
++		svc.async.enqueue(g, &endpointDeliverer{
++			client:   svc.async.client,
++			endpoint: "http://" + addr + "/invoke",
++			gate:     g.gate,
++		}, []byte(`{}`))
++	}
++
++	closed := make(chan struct{})
++
++	go func() {
++		_ = svc.Close()
++		close(closed)
++	}()
++
++	select {
++	case <-closed:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Service.Close hung while generations had retrying deliveries")
++	}
++}
+diff --git a/internal/service/lambda/runtime.go b/internal/service/lambda/runtime.go
+index 86fa125..5d6aab1 100644
+--- a/internal/service/lambda/runtime.go
++++ b/internal/service/lambda/runtime.go
+@@ -2,13 +2,13 @@ package lambda
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
+-	"sync"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+@@ -29,19 +29,31 @@ var errRuntimeNoPoller = errors.New("no runtime handler available to poll the in
+ // which AWS treats as a function error (limited retries).
+ var errRuntimeResponseTimeout = errors.New("runtime handler did not respond before the timeout")
+ 
++// errRuntimeFunctionGone is the stable error returned to a Runtime API
++// long poll whose generation is being deleted, has been retired, or whose
++// service is shutting down. It is stable (same status and body on every
++// retry) so an old handler process terminates instead of attaching itself
++// to a later, same-name generation.
++var errRuntimeFunctionGone = errors.New("runtime function generation is gone")
++
++// errRuntimeDeleting is returned to an invocation handoff that loses the
++// race with a delete boundary. The work was never picked up, so the async
++// deliverer treats it as a system error and retries; if the drain cannot
++// finish in time the delete is aborted and the delivery goes through.
++var errRuntimeDeleting = errors.New("runtime function generation is being deleted")
++
+ // runtimeBroker bridges kumo invocations to handlers that speak the AWS
+-// Lambda Runtime API (lambda.Start). A handler polls next for its function;
+-// kumo hands it queued invocations and collects the responses.
++// Lambda Runtime API (lambda.Start). It is stateless itself: every piece
++// of per-function state lives on the functionGeneration, so a handler
++// polls/responds against exactly one generation and a same-name
++// CreateFunction inherits none of the old runtime state.
+ type runtimeBroker struct {
+-	mu    sync.Mutex
+-	funcs map[string]*funcRuntime
++	// shutdown is closed when the whole service closes.
++	shutdown <-chan struct{}
+ }
+ 
+-type funcRuntime struct {
+-	invocations chan *runtimeInvocation
+-
+-	mu      sync.Mutex
+-	pending map[string]chan runtimeResult
++func newRuntimeBroker(shutdown <-chan struct{}) *runtimeBroker {
++	return &runtimeBroker{shutdown: shutdown}
+ }
+ 
+ type runtimeInvocation struct {
+@@ -54,36 +66,15 @@ type runtimeResult struct {
+ 	errored bool
+ }
+ 
+-func newRuntimeBroker() *runtimeBroker {
+-	return &runtimeBroker{funcs: make(map[string]*funcRuntime)}
+-}
+-
+-// registered reports whether a handler has ever polled for this function,
+-// i.e. the function is backed by a Runtime API handler.
+-func (b *runtimeBroker) registered(fn string) bool {
+-	b.mu.Lock()
+-	defer b.mu.Unlock()
+-
+-	_, ok := b.funcs[fn]
++// registered reports whether a handler has polled next on THIS generation,
++// i.e. the generation is backed by a Runtime API handler. A successor
++// generation always starts unregistered even if its name had a handler
++// before the delete.
++func (b *runtimeBroker) registered(g *functionGeneration) bool {
++	g.rtMu.Lock()
++	defer g.rtMu.Unlock()
+ 
+-	return ok
+-}
+-
+-// get returns (creating if needed) the per-function runtime state.
+-func (b *runtimeBroker) get(fn string) *funcRuntime {
+-	b.mu.Lock()
+-	defer b.mu.Unlock()
+-
+-	fr, ok := b.funcs[fn]
+-	if !ok {
+-		fr = &funcRuntime{
+-			invocations: make(chan *runtimeInvocation),
+-			pending:     make(map[string]chan runtimeResult),
+-		}
+-		b.funcs[fn] = fr
+-	}
+-
+-	return fr
++	return g.registered
+ }
+ 
+ // invoke hands an invocation to a polling handler and waits for its
+@@ -92,30 +83,41 @@ func (b *runtimeBroker) get(fn string) *funcRuntime {
+ // (fire-and-forget-but-not-really) semantics should queue a runtimeDeliverer
+ // on the asyncDispatcher instead of calling invoke directly — see
+ // invokeViaRuntime.
+-func (b *runtimeBroker) invoke(ctx context.Context, fn string, payload []byte, timeout time.Duration) (runtimeResult, error) {
+-	fr := b.get(fn)
++func (b *runtimeBroker) invoke(ctx context.Context, g *functionGeneration, payload []byte, timeout time.Duration) (runtimeResult, error) {
+ 	inv := &runtimeInvocation{id: uuid.New().String(), payload: payload}
+ 
+ 	resCh := make(chan runtimeResult, 1)
+ 
+-	fr.mu.Lock()
+-	fr.pending[inv.id] = resCh
+-	fr.mu.Unlock()
++	g.rtMu.Lock()
++	g.pending[inv.id] = resCh
++	g.rtMu.Unlock()
+ 
+ 	defer func() {
+-		fr.mu.Lock()
+-		delete(fr.pending, inv.id)
+-		fr.mu.Unlock()
++		g.rtMu.Lock()
++		delete(g.pending, inv.id)
++		g.rtMu.Unlock()
+ 	}()
+ 
++	// Phase 1: hand the invocation to a handler blocked in next. The
++	// delete and shutdown signals abort the handoff so queued attempts do
++	// not start work on a generation that is going away.
+ 	select {
+-	case fr.invocations <- inv:
++	case g.invocations <- inv:
+ 	case <-ctx.Done():
+ 		return runtimeResult{}, fmt.Errorf("invocation canceled: %w", ctx.Err())
++	case <-g.deletionSignal():
++		return runtimeResult{}, errRuntimeDeleting
++	case <-b.shutdown:
++		return runtimeResult{}, errRuntimeFunctionGone
+ 	case <-time.After(timeout):
+ 		return runtimeResult{}, errRuntimeNoPoller
+ 	}
+ 
++	// Phase 2: wait for the handler's result. The delete signal is
++	// deliberately not selected here: this invocation was already handed
++	// out before the boundary, so it is admitted work the delete must wait
++	// for. Interrupting it could only strand the handler and make its
++	// response "late".
+ 	select {
+ 	case res := <-resCh:
+ 		return res, nil
+@@ -127,13 +129,13 @@ func (b *runtimeBroker) invoke(ctx context.Context, fn string, payload []byte, t
+ }
+ 
+ // runtimeDeliverer delivers an event by handing it to a Runtime API handler
+-// through runtimeBroker's synchronous path — the async queue itself now
++// through the runtimeBroker's synchronous path — the async queue itself
+ // provides the asynchrony, so the deliverer only ever waits for one poll/
+ // response round trip per attempt. Counterpart of endpointDeliverer
+ // (async.go) for functions backed by an InvokeEndpoint.
+ type runtimeDeliverer struct {
+ 	broker *runtimeBroker
+-	fn     string
++	g      *functionGeneration
+ 
+ 	// waitTimeout bounds how long one delivery attempt waits for a handler
+ 	// to pick up and respond to the invocation. Zero means
+@@ -146,16 +148,17 @@ type runtimeDeliverer struct {
+ // errRuntimeResponseTimeout means a handler took the invocation but never
+ // responded — the function itself timed out, so this is a function error
+ // with limited retries, matching AWS async semantics. Any other failure
+-// (nobody polled, context canceled, ...) means the work was never picked up,
+-// so it is a system error retried with backoff until the event's deadline. A
+-// handler-reported error is likewise a function error.
++// (nobody polled, delete boundary, context canceled, ...) means the work
++// was never picked up, so it is a system error retried with backoff until
++// the event's deadline. A handler-reported error is likewise a function
++// error.
+ func (r *runtimeDeliverer) deliver(ctx context.Context, _ string, payload []byte) deliveryResult {
+ 	timeout := r.waitTimeout
+ 	if timeout == 0 {
+ 		timeout = runtimeInvokeTimeout
+ 	}
+ 
+-	res, err := r.broker.invoke(ctx, r.fn, payload, timeout)
++	res, err := r.broker.invoke(ctx, r.g, payload, timeout)
+ 	if err != nil {
+ 		if errors.Is(err, errRuntimeResponseTimeout) {
+ 			return asyncFunctionError
+@@ -171,29 +174,42 @@ func (r *runtimeDeliverer) deliver(ctx context.Context, _ string, payload []byte
+ 	return asyncDelivered
+ }
+ 
+-// next blocks until an invocation is queued for the function or ctx is done.
+-func (b *runtimeBroker) next(ctx context.Context, fn string) (*runtimeInvocation, error) {
+-	fr := b.get(fn)
++// next blocks until an invocation is queued for the generation or until the
++// generation goes away (delete/retire/shutdown) or ctx is done.
++func (b *runtimeBroker) next(ctx context.Context, g *functionGeneration) (*runtimeInvocation, error) {
++	g.rtMu.Lock()
++	g.registered = true
++	g.rtMu.Unlock()
+ 
+ 	select {
+-	case inv := <-fr.invocations:
++	case inv := <-g.invocations:
+ 		return inv, nil
++	case <-g.deletionSignal():
++		return nil, errRuntimeFunctionGone
++	case <-b.shutdown:
++		return nil, errRuntimeFunctionGone
+ 	case <-ctx.Done():
+ 		return nil, fmt.Errorf("next canceled: %w", ctx.Err())
+ 	}
+ }
+ 
+-// respond delivers a handler's result to the waiting invoker.
+-func (b *runtimeBroker) respond(fn, id string, payload []byte, errored bool) {
+-	fr := b.get(fn)
++// respond delivers a handler's result to the waiting invoker. It returns
++// false when this generation does not own the request id — for example a
++// response posted after the generation was retired and a same-name
++// successor created. The caller then rejects the response instead of ever
++// letting it reach the successor's pending table.
++func (b *runtimeBroker) respond(g *functionGeneration, id string, payload []byte, errored bool) bool {
++	g.rtMu.Lock()
++	ch := g.pending[id]
++	g.rtMu.Unlock()
++
++	if ch == nil {
++		return false
++	}
+ 
+-	fr.mu.Lock()
+-	ch := fr.pending[id]
+-	fr.mu.Unlock()
++	ch <- runtimeResult{payload: payload, errored: errored}
+ 
+-	if ch != nil {
+-		ch <- runtimeResult{payload: payload, errored: errored}
+-	}
++	return true
+ }
+ 
+ // ---- Runtime API HTTP handlers ----
+@@ -211,9 +227,25 @@ func (s *Service) RuntimeNext(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	inv, err := s.broker.next(r.Context(), fn)
++	g := s.lifecycles.get(fn)
++	if g == nil {
++		writeRuntimeGone(w, fn)
++
++		return
++	}
++
++	inv, err := s.broker.next(r.Context(), g)
+ 	if err != nil {
+-		// Client (handler) disconnected or shutting down.
++		if errors.Is(err, errRuntimeFunctionGone) {
++			// The function was deleted (or the service is shutting down):
++			// wake the long poll with a stable error instead of leaving it
++			// hanging.
++			writeRuntimeGone(w, fn)
++
++			return
++		}
++
++		// Client (handler) disconnected; nothing to write.
+ 		return
+ 	}
+ 
+@@ -249,7 +281,23 @@ func (s *Service) runtimeResult(w http.ResponseWriter, r *http.Request, errored
+ 		return
+ 	}
+ 
+-	s.broker.respond(fn, id, body, errored)
++	// Resolve the generation that OWNS the request id. A response from an
++	// old handler must never land in a same-name successor generation, and
++	// a response to an id nobody is waiting on is rejected with the same
++	// stable error RIE gives for expired request ids.
++	g := s.lifecycles.get(fn)
++
++	if g == nil || !s.broker.respond(g, id, body, errored) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusForbidden)
++
++		_ = json.NewEncoder(w).Encode(map[string]string{
++			"errorMessage": fmt.Sprintf("RequestId %s does not exist or belongs to a retired function generation", id),
++			"errorType":    "Runtime.InvalidRequestId",
++		})
++
++		return
++	}
+ 
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(http.StatusAccepted)
+@@ -263,6 +311,18 @@ func (s *Service) RuntimeInitError(w http.ResponseWriter, _ *http.Request) {
+ 	_, _ = w.Write([]byte(`{"status":"OK"}`))
+ }
+ 
++// writeRuntimeGone writes the stable error returned to Runtime API calls
++// whose function generation is being deleted or no longer exists.
++func writeRuntimeGone(w http.ResponseWriter, fn string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusGone)
++
++	_ = json.NewEncoder(w).Encode(map[string]string{
++		"errorMessage": fmt.Sprintf("Function %s is being deleted or no longer exists; terminate this runtime", fn),
++		"errorType":    "Runtime.FunctionDeleted",
++	})
++}
++
+ // runtimeFunctionName extracts {functionName} from a /_runtime/{fn}/... path.
+ func runtimeFunctionName(path string) string {
+ 	return segmentAfter(path, "_runtime")
+diff --git a/internal/service/lambda/service.go b/internal/service/lambda/service.go
+index 3071469..fb5bdca 100644
+--- a/internal/service/lambda/service.go
++++ b/internal/service/lambda/service.go
+@@ -1,6 +1,7 @@
+ package lambda
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"io"
+ 	"os"
+@@ -24,20 +25,46 @@ func init() {
+ 
+ // Service implements the Lambda service.
+ type Service struct {
+-	storage Storage
+-	baseURL string
+-	broker  *runtimeBroker
+-	async   *asyncDispatcher
++	storage    Storage
++	baseURL    string
++	lifecycles *lifecycleRegistry
++	broker     *runtimeBroker
++	async      *asyncDispatcher
+ }
+ 
+ // New creates a new Lambda service.
+ func New(storage Storage, baseURL string) *Service {
+-	return &Service{
+-		storage: storage,
+-		baseURL: baseURL,
+-		broker:  newRuntimeBroker(),
+-		async:   newAsyncDispatcher(),
++	dispatcher := newAsyncDispatcher()
++
++	s := &Service{
++		storage:    storage,
++		baseURL:    baseURL,
++		async:      dispatcher,
++		lifecycles: newLifecycleRegistry(dispatcher.done),
++		broker:     newRuntimeBroker(dispatcher.done),
+ 	}
++
++	// Functions restored from a persistence snapshot exist in storage but
++	// were created in a previous process; give each a fresh live generation.
++	s.restoreGenerations()
++
++	return s
++}
++
++// restoreGenerations creates live generations for every function already in
++// storage (startup with persistence enabled).
++func (s *Service) restoreGenerations() {
++	fns, _, err := s.storage.ListFunctions(context.Background(), "", 100000)
++	if err != nil {
++		return
++	}
++
++	names := make([]string, 0, len(fns))
++	for _, fn := range fns {
++		names = append(names, fn.FunctionName)
++	}
++
++	s.lifecycles.bootstrap(names)
+ }
+ 
+ // Name returns the service name.

@@ -2,13 +2,13 @@ package lambda
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,19 +29,31 @@ var errRuntimeNoPoller = errors.New("no runtime handler available to poll the in
 // which AWS treats as a function error (limited retries).
 var errRuntimeResponseTimeout = errors.New("runtime handler did not respond before the timeout")
 
+// errRuntimeFunctionGone is the stable error returned to a Runtime API
+// long poll whose generation is being deleted, has been retired, or whose
+// service is shutting down. It is stable (same status and body on every
+// retry) so an old handler process terminates instead of attaching itself
+// to a later, same-name generation.
+var errRuntimeFunctionGone = errors.New("runtime function generation is gone")
+
+// errRuntimeDeleting is returned to an invocation handoff that loses the
+// race with a delete boundary. The work was never picked up, so the async
+// deliverer treats it as a system error and retries; if the drain cannot
+// finish in time the delete is aborted and the delivery goes through.
+var errRuntimeDeleting = errors.New("runtime function generation is being deleted")
+
 // runtimeBroker bridges kumo invocations to handlers that speak the AWS
-// Lambda Runtime API (lambda.Start). A handler polls next for its function;
-// kumo hands it queued invocations and collects the responses.
+// Lambda Runtime API (lambda.Start). It is stateless itself: every piece
+// of per-function state lives on the functionGeneration, so a handler
+// polls/responds against exactly one generation and a same-name
+// CreateFunction inherits none of the old runtime state.
 type runtimeBroker struct {
-	mu    sync.Mutex
-	funcs map[string]*funcRuntime
+	// shutdown is closed when the whole service closes.
+	shutdown <-chan struct{}
 }
 
-type funcRuntime struct {
-	invocations chan *runtimeInvocation
-
-	mu      sync.Mutex
-	pending map[string]chan runtimeResult
+func newRuntimeBroker(shutdown <-chan struct{}) *runtimeBroker {
+	return &runtimeBroker{shutdown: shutdown}
 }
 
 type runtimeInvocation struct {
@@ -54,36 +66,15 @@ type runtimeResult struct {
 	errored bool
 }
 
-func newRuntimeBroker() *runtimeBroker {
-	return &runtimeBroker{funcs: make(map[string]*funcRuntime)}
-}
+// registered reports whether a handler has polled next on THIS generation,
+// i.e. the generation is backed by a Runtime API handler. A successor
+// generation always starts unregistered even if its name had a handler
+// before the delete.
+func (b *runtimeBroker) registered(g *functionGeneration) bool {
+	g.rtMu.Lock()
+	defer g.rtMu.Unlock()
 
-// registered reports whether a handler has ever polled for this function,
-// i.e. the function is backed by a Runtime API handler.
-func (b *runtimeBroker) registered(fn string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	_, ok := b.funcs[fn]
-
-	return ok
-}
-
-// get returns (creating if needed) the per-function runtime state.
-func (b *runtimeBroker) get(fn string) *funcRuntime {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	fr, ok := b.funcs[fn]
-	if !ok {
-		fr = &funcRuntime{
-			invocations: make(chan *runtimeInvocation),
-			pending:     make(map[string]chan runtimeResult),
-		}
-		b.funcs[fn] = fr
-	}
-
-	return fr
+	return g.registered
 }
 
 // invoke hands an invocation to a polling handler and waits for its
@@ -92,30 +83,41 @@ func (b *runtimeBroker) get(fn string) *funcRuntime {
 // (fire-and-forget-but-not-really) semantics should queue a runtimeDeliverer
 // on the asyncDispatcher instead of calling invoke directly — see
 // invokeViaRuntime.
-func (b *runtimeBroker) invoke(ctx context.Context, fn string, payload []byte, timeout time.Duration) (runtimeResult, error) {
-	fr := b.get(fn)
+func (b *runtimeBroker) invoke(ctx context.Context, g *functionGeneration, payload []byte, timeout time.Duration) (runtimeResult, error) {
 	inv := &runtimeInvocation{id: uuid.New().String(), payload: payload}
 
 	resCh := make(chan runtimeResult, 1)
 
-	fr.mu.Lock()
-	fr.pending[inv.id] = resCh
-	fr.mu.Unlock()
+	g.rtMu.Lock()
+	g.pending[inv.id] = resCh
+	g.rtMu.Unlock()
 
 	defer func() {
-		fr.mu.Lock()
-		delete(fr.pending, inv.id)
-		fr.mu.Unlock()
+		g.rtMu.Lock()
+		delete(g.pending, inv.id)
+		g.rtMu.Unlock()
 	}()
 
+	// Phase 1: hand the invocation to a handler blocked in next. The
+	// delete and shutdown signals abort the handoff so queued attempts do
+	// not start work on a generation that is going away.
 	select {
-	case fr.invocations <- inv:
+	case g.invocations <- inv:
 	case <-ctx.Done():
 		return runtimeResult{}, fmt.Errorf("invocation canceled: %w", ctx.Err())
+	case <-g.deletionSignal():
+		return runtimeResult{}, errRuntimeDeleting
+	case <-b.shutdown:
+		return runtimeResult{}, errRuntimeFunctionGone
 	case <-time.After(timeout):
 		return runtimeResult{}, errRuntimeNoPoller
 	}
 
+	// Phase 2: wait for the handler's result. The delete signal is
+	// deliberately not selected here: this invocation was already handed
+	// out before the boundary, so it is admitted work the delete must wait
+	// for. Interrupting it could only strand the handler and make its
+	// response "late".
 	select {
 	case res := <-resCh:
 		return res, nil
@@ -127,13 +129,13 @@ func (b *runtimeBroker) invoke(ctx context.Context, fn string, payload []byte, t
 }
 
 // runtimeDeliverer delivers an event by handing it to a Runtime API handler
-// through runtimeBroker's synchronous path — the async queue itself now
+// through the runtimeBroker's synchronous path — the async queue itself
 // provides the asynchrony, so the deliverer only ever waits for one poll/
 // response round trip per attempt. Counterpart of endpointDeliverer
 // (async.go) for functions backed by an InvokeEndpoint.
 type runtimeDeliverer struct {
 	broker *runtimeBroker
-	fn     string
+	g      *functionGeneration
 
 	// waitTimeout bounds how long one delivery attempt waits for a handler
 	// to pick up and respond to the invocation. Zero means
@@ -146,16 +148,17 @@ type runtimeDeliverer struct {
 // errRuntimeResponseTimeout means a handler took the invocation but never
 // responded — the function itself timed out, so this is a function error
 // with limited retries, matching AWS async semantics. Any other failure
-// (nobody polled, context canceled, ...) means the work was never picked up,
-// so it is a system error retried with backoff until the event's deadline. A
-// handler-reported error is likewise a function error.
+// (nobody polled, delete boundary, context canceled, ...) means the work
+// was never picked up, so it is a system error retried with backoff until
+// the event's deadline. A handler-reported error is likewise a function
+// error.
 func (r *runtimeDeliverer) deliver(ctx context.Context, _ string, payload []byte) deliveryResult {
 	timeout := r.waitTimeout
 	if timeout == 0 {
 		timeout = runtimeInvokeTimeout
 	}
 
-	res, err := r.broker.invoke(ctx, r.fn, payload, timeout)
+	res, err := r.broker.invoke(ctx, r.g, payload, timeout)
 	if err != nil {
 		if errors.Is(err, errRuntimeResponseTimeout) {
 			return asyncFunctionError
@@ -171,29 +174,42 @@ func (r *runtimeDeliverer) deliver(ctx context.Context, _ string, payload []byte
 	return asyncDelivered
 }
 
-// next blocks until an invocation is queued for the function or ctx is done.
-func (b *runtimeBroker) next(ctx context.Context, fn string) (*runtimeInvocation, error) {
-	fr := b.get(fn)
+// next blocks until an invocation is queued for the generation or until the
+// generation goes away (delete/retire/shutdown) or ctx is done.
+func (b *runtimeBroker) next(ctx context.Context, g *functionGeneration) (*runtimeInvocation, error) {
+	g.rtMu.Lock()
+	g.registered = true
+	g.rtMu.Unlock()
 
 	select {
-	case inv := <-fr.invocations:
+	case inv := <-g.invocations:
 		return inv, nil
+	case <-g.deletionSignal():
+		return nil, errRuntimeFunctionGone
+	case <-b.shutdown:
+		return nil, errRuntimeFunctionGone
 	case <-ctx.Done():
 		return nil, fmt.Errorf("next canceled: %w", ctx.Err())
 	}
 }
 
-// respond delivers a handler's result to the waiting invoker.
-func (b *runtimeBroker) respond(fn, id string, payload []byte, errored bool) {
-	fr := b.get(fn)
+// respond delivers a handler's result to the waiting invoker. It returns
+// false when this generation does not own the request id — for example a
+// response posted after the generation was retired and a same-name
+// successor created. The caller then rejects the response instead of ever
+// letting it reach the successor's pending table.
+func (b *runtimeBroker) respond(g *functionGeneration, id string, payload []byte, errored bool) bool {
+	g.rtMu.Lock()
+	ch := g.pending[id]
+	g.rtMu.Unlock()
 
-	fr.mu.Lock()
-	ch := fr.pending[id]
-	fr.mu.Unlock()
-
-	if ch != nil {
-		ch <- runtimeResult{payload: payload, errored: errored}
+	if ch == nil {
+		return false
 	}
+
+	ch <- runtimeResult{payload: payload, errored: errored}
+
+	return true
 }
 
 // ---- Runtime API HTTP handlers ----
@@ -211,9 +227,25 @@ func (s *Service) RuntimeNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inv, err := s.broker.next(r.Context(), fn)
+	g := s.lifecycles.get(fn)
+	if g == nil {
+		writeRuntimeGone(w, fn)
+
+		return
+	}
+
+	inv, err := s.broker.next(r.Context(), g)
 	if err != nil {
-		// Client (handler) disconnected or shutting down.
+		if errors.Is(err, errRuntimeFunctionGone) {
+			// The function was deleted (or the service is shutting down):
+			// wake the long poll with a stable error instead of leaving it
+			// hanging.
+			writeRuntimeGone(w, fn)
+
+			return
+		}
+
+		// Client (handler) disconnected; nothing to write.
 		return
 	}
 
@@ -249,7 +281,23 @@ func (s *Service) runtimeResult(w http.ResponseWriter, r *http.Request, errored 
 		return
 	}
 
-	s.broker.respond(fn, id, body, errored)
+	// Resolve the generation that OWNS the request id. A response from an
+	// old handler must never land in a same-name successor generation, and
+	// a response to an id nobody is waiting on is rejected with the same
+	// stable error RIE gives for expired request ids.
+	g := s.lifecycles.get(fn)
+
+	if g == nil || !s.broker.respond(g, id, body, errored) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"errorMessage": fmt.Sprintf("RequestId %s does not exist or belongs to a retired function generation", id),
+			"errorType":    "Runtime.InvalidRequestId",
+		})
+
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -261,6 +309,18 @@ func (s *Service) RuntimeInitError(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"OK"}`))
+}
+
+// writeRuntimeGone writes the stable error returned to Runtime API calls
+// whose function generation is being deleted or no longer exists.
+func writeRuntimeGone(w http.ResponseWriter, fn string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusGone)
+
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"errorMessage": fmt.Sprintf("Function %s is being deleted or no longer exists; terminate this runtime", fn),
+		"errorType":    "Runtime.FunctionDeleted",
+	})
 }
 
 // runtimeFunctionName extracts {functionName} from a /_runtime/{fn}/... path.

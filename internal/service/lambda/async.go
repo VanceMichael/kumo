@@ -47,10 +47,11 @@ type asyncEvent struct {
 	deadline  time.Time
 }
 
-// asyncDispatcher queues Event invocations per function and delivers them in
-// FIFO order via each event's asyncDeliverer (InvokeEndpoint or Runtime API).
-// Delivery is retried with exponential backoff, so a 202 from Invoke means
-// "accepted for delivery" rather than "attempted once" (issue #803).
+// asyncDispatcher owns the process-wide machinery behind Event invocations:
+// the HTTP client, retry/backoff configuration, the service shutdown signal
+// and the WaitGroup tracking every drain goroutine. Per-function state
+// (queues, gates, runtime handoff) lives on functionGeneration so it is
+// drained and retired together with the function resource.
 type asyncDispatcher struct {
 	client *http.Client
 	done   chan struct{}
@@ -59,10 +60,6 @@ type asyncDispatcher struct {
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 	maxEventAge    time.Duration
-
-	mu     sync.Mutex
-	queues map[string]chan *asyncEvent
-	gates  map[string]invokeGate
 }
 
 func newAsyncDispatcher() *asyncDispatcher {
@@ -72,38 +69,17 @@ func newAsyncDispatcher() *asyncDispatcher {
 		initialBackoff: asyncInitialBackoff,
 		maxBackoff:     asyncMaxBackoff,
 		maxEventAge:    asyncMaxEventAge,
-		queues:         make(map[string]chan *asyncEvent),
-		gates:          make(map[string]invokeGate),
 	}
-}
-
-// gate returns (creating if needed) the semaphore that serializes every
-// InvokeEndpoint HTTP call for functionName, synchronous and asynchronous
-// alike, so a single-concurrency endpoint (e.g. the Lambda RIE) never
-// receives two overlapping requests (issue #859). The dispatcher's own mu
-// only guards the lookup/creation below; it is never held while a caller
-// blocks on the returned gate.
-func (d *asyncDispatcher) gate(functionName string) invokeGate {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	g, ok := d.gates[functionName]
-	if !ok {
-		g = newInvokeGate()
-		d.gates[functionName] = g
-	}
-
-	return g
 }
 
 // invokeGate is a binary semaphore (a capacity-1 channel) that serializes
-// InvokeEndpoint HTTP calls for one function across the synchronous and
-// asynchronous invoke paths. Acquisition is context-aware: a caller gives up
-// waiting when its context is done instead of blocking forever on a peer
-// that never releases the gate. This matters most for the async drain
-// goroutine, whose delivery context is canceled when the dispatcher closes —
-// without that, a stuck synchronous invoke holding the gate would prevent
-// asyncDispatcher.close from ever returning.
+// InvokeEndpoint HTTP calls for one generation across the synchronous and
+// asynchronous invoke paths. Acquisition is context-aware: a caller gives
+// up waiting when its context is done instead of blocking forever on a
+// peer that never releases the gate. This matters most for the async drain
+// goroutine, whose delivery context is canceled when the dispatcher closes
+// — without that, a stuck synchronous invoke holding the gate would
+// prevent asyncDispatcher.close from ever returning.
 type invokeGate chan struct{}
 
 func newInvokeGate() invokeGate {
@@ -125,9 +101,38 @@ func (g invokeGate) release() {
 	<-g
 }
 
-// enqueue places an event on the function's FIFO queue without blocking the
-// caller. The drain goroutine for the function is started on first use.
-func (d *asyncDispatcher) enqueue(functionName string, deliverer asyncDeliverer, payload []byte) {
+// enqueue places an event on the generation's FIFO queue and accounts for
+// it as in-flight work before the caller can return 202, so a concurrent
+// DeleteFunction is guaranteed to wait for it. It returns false when the
+// generation's delete boundary has already been set, in which case nothing
+// was queued and the caller must reject the invocation. Enqueue itself
+// never blocks: a full queue is reported as a dropped event whose work
+// count is released immediately.
+func (d *asyncDispatcher) enqueue(g *functionGeneration, deliverer asyncDeliverer, payload []byte) bool {
+	g.admMu.Lock()
+	if g.deleting {
+		g.admMu.Unlock()
+
+		return false
+	}
+
+	g.inflight++
+
+	if g.queue == nil {
+		g.queue = make(chan *asyncEvent, asyncQueueCapacity)
+	}
+
+	if !g.drainStarted {
+		g.drainStarted = true
+
+		d.wg.Add(1)
+
+		go d.drain(g)
+	}
+
+	q := g.queue
+	g.admMu.Unlock()
+
 	payloadCopy := make([]byte, len(payload))
 	copy(payloadCopy, payload)
 
@@ -137,24 +142,14 @@ func (d *asyncDispatcher) enqueue(functionName string, deliverer asyncDeliverer,
 		deadline:  time.Now().Add(d.maxEventAge),
 	}
 
-	d.mu.Lock()
-
-	q, ok := d.queues[functionName]
-	if !ok {
-		q = make(chan *asyncEvent, asyncQueueCapacity)
-		d.queues[functionName] = q
-
-		d.wg.Add(1)
-
-		go d.drain(functionName, q)
-	}
-	d.mu.Unlock()
-
 	select {
 	case q <- ev:
 	default:
-		slog.Error("async invoke queue full, event dropped", "function", functionName)
+		g.workDone()
+		slog.Error("async invoke queue full, event dropped", "function", g.name)
 	}
+
+	return true
 }
 
 // close stops all drain goroutines and waits for them to exit. In-flight
@@ -165,13 +160,13 @@ func (d *asyncDispatcher) close() {
 }
 
 // drain delivers queued events one at a time. Head-of-line blocking is
-// deliberate: it preserves per-function delivery order.
-func (d *asyncDispatcher) drain(functionName string, q chan *asyncEvent) {
+// deliberate: it preserves per-function delivery order. The goroutine exits
+// on service shutdown or when its generation has been drained and retired.
+func (d *asyncDispatcher) drain(g *functionGeneration) {
 	defer d.wg.Done()
 
 	// Lifecycle context for this goroutine's deliveries, canceled when the
-	// dispatcher closes so in-flight requests are aborted. Created here and
-	// passed down instead of being stored on the dispatcher.
+	// dispatcher closes so in-flight requests are aborted.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -187,8 +182,10 @@ func (d *asyncDispatcher) drain(functionName string, q chan *asyncEvent) {
 		select {
 		case <-d.done:
 			return
-		case ev := <-q:
-			d.deliver(ctx, functionName, ev)
+		case <-g.stopDrain:
+			return
+		case ev := <-g.queue:
+			d.deliver(ctx, g, ev)
 		}
 	}
 }
@@ -207,20 +204,24 @@ const (
 	asyncPermanentFailure
 )
 
-// deliver hands the event to its deliverer, retrying failures until the event
-// is delivered, exhausts its function-error retries, or expires.
-func (d *asyncDispatcher) deliver(ctx context.Context, functionName string, ev *asyncEvent) {
+// deliver hands the event to its deliverer, retrying failures until the
+// event is delivered, exhausts its function-error retries, or expires. The
+// event's work count — acquired in enqueue — is released when it reaches a
+// terminal state, which is exactly what DeleteFunction waits for.
+func (d *asyncDispatcher) deliver(ctx context.Context, g *functionGeneration, ev *asyncEvent) {
+	defer g.workDone()
+
 	backoff := d.initialBackoff
 	functionErrorRetries := 0
 
 	for {
-		switch ev.deliverer.deliver(ctx, functionName, ev.payload) {
+		switch ev.deliverer.deliver(ctx, g.name, ev.payload) {
 		case asyncDelivered, asyncPermanentFailure:
 			return
 		case asyncFunctionError:
 			if functionErrorRetries >= asyncMaxFunctionErrorRetries {
 				slog.Error("async invoke dropped after function error retries",
-					"function", functionName, "retries", functionErrorRetries)
+					"function", g.name, "retries", functionErrorRetries)
 
 				return
 			}
@@ -228,7 +229,7 @@ func (d *asyncDispatcher) deliver(ctx context.Context, functionName string, ev *
 			functionErrorRetries++
 		case asyncSystemError:
 			if time.Now().After(ev.deadline) {
-				slog.Error("async invoke dropped, event expired", "function", functionName)
+				slog.Error("async invoke dropped, event expired", "function", g.name)
 
 				return
 			}
@@ -252,8 +253,7 @@ type endpointDeliverer struct {
 	endpoint string
 
 	// gate serializes this attempt's HTTP call against every other
-	// InvokeEndpoint call (sync or async) for the same function; see
-	// asyncDispatcher.gate.
+	// InvokeEndpoint call (sync or async) for the same generation.
 	gate invokeGate
 }
 

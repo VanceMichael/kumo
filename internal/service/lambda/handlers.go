@@ -40,7 +40,16 @@ func (s *Service) CreateFunction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fn, err := s.storage.CreateFunction(r.Context(), &req)
+	// Serialize against a concurrent DeleteFunction (and CreateFunction)
+	// for the same name so resource insertion and the fresh generation are
+	// committed as one step.
+	op := s.lifecycles.opLock(req.FunctionName)
+	op.Lock()
+	defer op.Unlock()
+
+	fn, _, err := s.lifecycles.create(req.FunctionName, func() (*Function, error) {
+		return s.storage.CreateFunction(r.Context(), &req)
+	})
 	if err != nil {
 		var lambdaErr *FunctionError
 		if errors.As(err, &lambdaErr) {
@@ -133,6 +142,17 @@ func (s *Service) GetFunctionConfiguration(w http.ResponseWriter, r *http.Reques
 }
 
 // DeleteFunction handles the DeleteFunction API.
+//
+// Deletion is two-phased against the function's generation: first a
+// boundary is set that rejects new Invoke admissions and wakes idle
+// Runtime API long polls, then the call waits for every invocation admitted
+// before the boundary (synchronous and asynchronous, endpoint and runtime)
+// to finish. The storage resource is removed and the generation retired
+// only once that work has fully exited. If the drain cannot finish within
+// the request deadline, the boundary is rolled back and the request fails:
+// the function stays queryable and usable so the caller can restore the
+// execution target and retry. A same-name CreateFunction afterwards starts
+// a brand-new generation that inherits no queue, gate, payload or poller.
 func (s *Service) DeleteFunction(w http.ResponseWriter, r *http.Request) {
 	functionName := extractFunctionName(r.URL.Path)
 	if functionName == "" {
@@ -141,24 +161,60 @@ func (s *Service) DeleteFunction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.storage.DeleteFunction(r.Context(), functionName)
-	if err != nil {
-		var lambdaErr *FunctionError
-		if errors.As(err, &lambdaErr) {
-			status := http.StatusBadRequest
-			if lambdaErr.Type == ErrResourceNotFound {
-				status = http.StatusNotFound
-			}
+	// Serialize against CreateFunction and a concurrent DeleteFunction for
+	// the same name. This is a per-name lock: deleting one function never
+	// blocks operations on another.
+	op := s.lifecycles.opLock(functionName)
+	op.Lock()
+	defer op.Unlock()
 
-			writeFunctionError(w, lambdaErr.Type, lambdaErr.Message, status)
+	if _, err := s.storage.GetFunction(r.Context(), functionName); err != nil {
+		handleGetFunctionError(w, err)
 
-			return
-		}
+		return
+	}
 
+	g := s.lifecycles.get(functionName)
+	if g == nil {
 		writeFunctionError(w, ErrServiceException, "Internal server error", http.StatusInternalServerError)
 
 		return
 	}
+
+	// Phase 1: establish the delete boundary. Invokes admitted after this
+	// point are rejected; queued and in-flight work keeps running.
+	g.beginDeletion()
+
+	// Wait for all pre-boundary work to end. The work itself is never
+	// interrupted here; a timeout means convergence was impossible within
+	// the request deadline.
+	if err := g.waitWork(r.Context()); err != nil {
+		// Roll the boundary back: the function remains queryable and fully
+		// usable, including its queued deliveries and pollers.
+		g.abortDeletion()
+
+		writeFunctionError(w, ErrResourceConflict,
+			fmt.Sprintf("Function %s could not be drained before the request deadline (%v); the function was retained and is still usable", functionName, err),
+			http.StatusConflict)
+
+		return
+	}
+
+	// Phase 2: the old generation has fully exited. Commit resource
+	// removal plus generation retirement first; only then release the
+	// (idle) drain goroutine. If the commit somehow fails the boundary is
+	// rolled back and the generation — drain included — is fully usable.
+	if err := s.lifecycles.retire(functionName, g, func() error {
+		return s.storage.DeleteFunction(r.Context(), functionName)
+	}); err != nil {
+		g.abortDeletion()
+
+		handleFunctionError(w, err)
+
+		return
+	}
+
+	g.stopDrainLoop()
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -312,28 +368,63 @@ func (s *Service) Invoke(w http.ResponseWriter, r *http.Request) {
 
 	async := invocationType == "Event"
 
-	// Resolution order: a handler polling the Runtime API wins, then a
-	// configured InvokeEndpoint, otherwise there is nothing to execute.
+	g := s.lifecycles.get(functionName)
+	if g == nil {
+		writeFunctionError(w, ErrResourceNotFound, "Function not found: "+functionName, http.StatusNotFound)
+
+		return
+	}
+
+	// Synchronous invocations are admitted here: the work count is
+	// acquired (and thus visible to a concurrent DeleteFunction) before
+	// anything is dispatched, and released only when this handler returns.
+	// Asynchronous admissions happen atomically inside enqueue.
+	if !async {
+		if !g.admit() {
+			writeFunctionError(w, ErrResourceConflict,
+				"Function "+functionName+" is being deleted", http.StatusConflict)
+
+			return
+		}
+
+		defer g.workDone()
+	}
+
+	// Resolution order: a handler polling the Runtime API on THIS
+	// generation wins, then a configured InvokeEndpoint, otherwise there
+	// is nothing to execute.
 	switch {
-	case s.broker.registered(functionName):
-		s.invokeViaRuntime(w, r, functionName, payload, async)
+	case s.broker.registered(g):
+		s.invokeViaRuntime(w, r, g, payload, async)
 	case fn.InvokeEndpoint != "":
-		s.invokeViaEndpoint(w, r, functionName, fn.InvokeEndpoint, payload, async)
+		s.invokeViaEndpoint(w, r, g, fn.InvokeEndpoint, payload, async)
 	default:
-		s.invokeNoBackend(w, functionName, async)
+		s.invokeNoBackend(w, functionName, g, async)
 	}
 }
 
+// writeFunctionDeleting rejects an invocation that reached a generation
+// whose delete boundary has already been set.
+func writeFunctionDeleting(w http.ResponseWriter, fn string) {
+	writeFunctionError(w, ErrResourceConflict,
+		"Function "+fn+" is being deleted", http.StatusConflict)
+}
+
 // invokeViaRuntime dispatches to a handler connected through the Runtime API.
-func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, fn string, payload []byte, async bool) {
+func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, g *functionGeneration, payload []byte, async bool) {
 	if async {
-		s.async.enqueue(fn, &runtimeDeliverer{broker: s.broker, fn: fn}, payload)
+		if !s.async.enqueue(g, &runtimeDeliverer{broker: s.broker, g: g}, payload) {
+			writeFunctionDeleting(w, g.name)
+
+			return
+		}
+
 		writeInvokeAccepted(w)
 
 		return
 	}
 
-	res, err := s.broker.invoke(r.Context(), fn, payload, runtimeInvokeTimeout)
+	res, err := s.broker.invoke(r.Context(), g, payload, runtimeInvokeTimeout)
 	if err != nil {
 		writeFunctionError(w, ErrServiceException, "runtime invocation failed: "+err.Error(), http.StatusBadGateway)
 
@@ -353,28 +444,41 @@ func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, fn st
 // invokeViaEndpoint forwards to a function's configured InvokeEndpoint.
 // Async invocations are queued on the dispatcher so the 202 means "accepted
 // for delivery": failed deliveries are retried instead of dropped. Both the
-// async delivery attempt and the synchronous call below share the same
-// per-function gate (asyncDispatcher.gate) so a single-concurrency endpoint,
-// such as the Lambda RIE, never sees two overlapping requests (issue #859).
-func (s *Service) invokeViaEndpoint(w http.ResponseWriter, r *http.Request, fn, endpoint string, payload []byte, async bool) {
-	gate := s.async.gate(fn)
-
+// async delivery attempt and the synchronous call below share the
+// generation's gate so a single-concurrency endpoint, such as the Lambda
+// RIE, never sees two overlapping requests (issue #859).
+func (s *Service) invokeViaEndpoint(w http.ResponseWriter, r *http.Request, g *functionGeneration, endpoint string, payload []byte, async bool) {
 	if async {
-		s.async.enqueue(fn, &endpointDeliverer{client: s.async.client, endpoint: endpoint, gate: gate}, payload)
+		if !s.async.enqueue(g, &endpointDeliverer{client: s.async.client, endpoint: endpoint, gate: g.gate}, payload) {
+			writeFunctionDeleting(w, g.name)
+
+			return
+		}
+
 		writeInvokeAccepted(w)
 
 		return
 	}
 
-	s.invokeSync(r.Context(), w, endpoint, payload, gate)
+	s.invokeSync(r.Context(), w, endpoint, payload, g.gate)
 }
 
 // invokeNoBackend handles a function with neither a Runtime API handler nor an
 // InvokeEndpoint. Async invocations are accepted (and dropped); a
 // RequestResponse invocation has nothing to execute and fails — kumo does not
 // fabricate an echo response.
-func (s *Service) invokeNoBackend(w http.ResponseWriter, fn string, async bool) {
+func (s *Service) invokeNoBackend(w http.ResponseWriter, fn string, g *functionGeneration, async bool) {
 	if async {
+		// Nothing is queued or executed, but the boundary still applies:
+		// an Event after it must not be reported as accepted.
+		if !g.admit() {
+			writeFunctionDeleting(w, fn)
+
+			return
+		}
+
+		g.workDone()
+
 		writeInvokeAccepted(w)
 
 		return
