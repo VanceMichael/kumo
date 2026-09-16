@@ -94,9 +94,18 @@ func (s *Service) PostObject(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-amz-version-id", obj.VersionID)
 	}
 
-	go s.emitObjectCreatedEvent(context.Background(), bucket, upload.key, obj.Size, obj.ETag)
-	go s.emitSQSNotifications(context.Background(), bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
-	go s.emitLambdaNotifications(context.Background(), bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
+	// Tracked deliveries for the work this successful POST accepted. POST
+	// Object historically emits EventBridge, SQS and Lambda only (no SNS
+	// TopicConfiguration), so the three existing targets are preserved.
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitObjectCreatedEvent(ctx, bucket, upload.key, obj.Size, obj.ETag)
+	})
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitSQSNotifications(ctx, bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
+	})
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitLambdaNotifications(ctx, bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
+	})
 
 	writePostObjectResponse(w, r, bucket, upload.key, obj)
 }

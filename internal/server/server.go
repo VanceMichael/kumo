@@ -109,12 +109,19 @@ func New(config Config) *Server {
 		srv.RegisterService(svc)
 	}
 
+	// In-process transport for internal self-calls (S3 -> Lambda async
+	// Invoke, S3 -> EventBridge PutEvents). It keeps those targets
+	// reachable during shutdown even though the network listener is
+	// already closed.
+	internalDoer := &inProcessDoer{handler: router}
+
 	// Cross-service wiring (must happen after all services are registered).
 	wireSNStoSQS(registry)
 	wireS3toSQS(registry)
-	wireS3toLambda(registry)
+	wireS3toLambda(registry, internalDoer)
 	wireS3toSNS(registry)
 	wireCloudWatchToSNS(registry)
+	wireS3EventBridgeInProcess(registry, internalDoer)
 
 	hasJSONServices := len(jsonDispatcher.handlers) > 0
 	hasQueryServices := len(queryDispatcher.handlers) > 0
@@ -241,16 +248,38 @@ func (s *Server) Start(readyCh ...chan struct{}) error {
 	return nil
 }
 
+// notificationDrainer is implemented by services that accept asynchronous
+// notification work from request handlers and need a bounded drain after
+// the HTTP listener stops (currently s3.Service). The drain must run while
+// every delivery target is still open, before the services are closed.
+type notificationDrainer interface {
+	ShutdownNotifications(ctx context.Context) error
+}
+
 // Shutdown gracefully shuts down the server.
+//
+// The order is deliberate and must not depend on registry map iteration:
+//
+//  1. Stop accepting new HTTP requests and finish in-flight handlers.
+//     Object write handlers register their accepted ObjectCreated
+//     notifications synchronously before returning, so by the time this
+//     returns the whole batch is tracked.
+//  2. Drain those notifications while SQS, SNS, Lambda and EventBridge are
+//     all still available (in-process targets need no listener). A blocked
+//     delivery that finishes within ctx makes Shutdown succeed; when ctx
+//     expires the deliveries are canceled and the recognizable
+//     context.DeadlineExceeded is returned.
+//  3. Close the services for their final snapshots. All
+//     notification-induced state has settled, so close order is
+//     irrelevant and persistence cannot lose a late delivery.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down server")
 
-	// Drain in-flight requests first so no handler mutates state after we take
-	// the final snapshot. Persistence is now debounced (see internal/storage), so
-	// a mutation that lands after Close would otherwise be lost on exit.
 	if err := s.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("failed to shutdown server: %w", err)
 	}
+
+	drainErr := s.drainNotifications(ctx)
 
 	for _, svc := range s.registry.All() {
 		if c, ok := svc.(io.Closer); ok {
@@ -258,6 +287,29 @@ func (s *Server) Shutdown(ctx context.Context) error {
 				s.logger.Error("failed to save snapshot", "service", svc.Name(), "error", err)
 			}
 		}
+	}
+
+	return drainErr
+}
+
+// drainNotifications runs the S3 service's accepted-notification drain with
+// the shutdown deadline. It is a no-op when S3 is absent or does not
+// implement draining.
+func (s *Server) drainNotifications(ctx context.Context) error {
+	s3Svc, ok := s.registry.Get("s3")
+	if !ok {
+		return nil
+	}
+
+	drainer, ok := s3Svc.(notificationDrainer)
+	if !ok {
+		return nil
+	}
+
+	if err := drainer.ShutdownNotifications(ctx); err != nil {
+		s.logger.Error("S3 event notification drain did not finish in time", "error", err)
+
+		return fmt.Errorf("drain S3 event notifications: %w", err)
 	}
 
 	return nil

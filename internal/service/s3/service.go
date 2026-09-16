@@ -73,14 +73,18 @@ type Service struct {
 	sqsPublisher  SQSPublisher
 	lambdaInvoker LambdaInvoker
 	snsPublisher  SNSPublisher
+	notifications *notificationTracker
+	eventClient   HTTPDoer
 }
 
 // New creates a new S3 service.
 func New(storage Storage, baseURL string) *Service {
 	return &Service{
-		storage: storage,
-		baseURL: baseURL,
-		logger:  slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		storage:       storage,
+		baseURL:       baseURL,
+		logger:        slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		notifications: newNotificationTracker(),
+		eventClient:   &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -150,6 +154,50 @@ func (s *Service) SetLambdaInvoker(inv LambdaInvoker) {
 // layer after all services have been registered.
 func (s *Service) SetSNSPublisher(p SNSPublisher) {
 	s.snsPublisher = p
+}
+
+// HTTPDoer executes an HTTP request. *http.Client satisfies it; the server
+// wiring substitutes an in-process implementation so EventBridge delivery
+// stays reachable during shutdown, after the network listener has closed.
+type HTTPDoer interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// SetEventBridgeClient installs the client used to deliver Object Created
+// events to the internal EventBridge endpoint. Called by the server wiring
+// layer after all services have been registered.
+func (s *Service) SetEventBridgeClient(c HTTPDoer) {
+	s.eventClient = c
+}
+
+// ShutdownNotifications drains event-notification deliveries accepted by
+// successful object writes. It must be called after the HTTP server has
+// stopped accepting new requests and while the SQS, SNS, Lambda and
+// EventBridge targets are still available. It is idempotent and safe for
+// concurrent use; it returns context.DeadlineExceeded (recognizable via
+// errors.Is) when ctx expires before every delivery finishes.
+func (s *Service) ShutdownNotifications(ctx context.Context) error {
+	return s.notifications.Shutdown(ctx)
+}
+
+// dispatchObjectCreatedNotifications fans a single accepted ObjectCreated
+// write out to every notification target type. Each target type runs in
+// its own tracked goroutine, so one slow or failing target can neither
+// block nor cancel the others; delivery failures are logged and never
+// alter the object write's already-returned success result.
+func (s *Service) dispatchObjectCreatedNotifications(bucket, key, eventName string, size int64, etag string) {
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitObjectCreatedEvent(ctx, bucket, key, size, etag)
+	})
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitSQSNotifications(ctx, bucket, key, eventName, size, etag)
+	})
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitLambdaNotifications(ctx, bucket, key, eventName, size, etag)
+	})
+	s.notifications.goNotify(func(ctx context.Context) {
+		s.emitSNSNotifications(ctx, bucket, key, eventName, size, etag)
+	})
 }
 
 // buildEventNotification constructs the S3 event notification message
@@ -382,7 +430,7 @@ func (s *Service) putEvents(ctx context.Context, body []byte, bucket, key string
 	req.Header.Set("Content-Type", "application/x-amz-json-1.1")
 	req.Header.Set("X-Amz-Target", "AWSEvents.PutEvents")
 
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	resp, err := s.eventClient.Do(req)
 	if err != nil {
 		s.logger.Error("failed to emit S3 event to EventBridge", "error", err)
 

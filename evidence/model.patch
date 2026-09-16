@@ -1,0 +1,1686 @@
+diff --git a/internal/server/internal_delivery.go b/internal/server/internal_delivery.go
+new file mode 100644
+index 0000000..1a44901
+--- /dev/null
++++ b/internal/server/internal_delivery.go
+@@ -0,0 +1,69 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++
++	"github.com/sivchari/kumo/internal/service"
++	"github.com/sivchari/kumo/internal/service/s3"
++)
++
++// httpDoer is the minimal HTTP client surface the internal notification
++// adapters depend on. *http.Client satisfies it.
++type httpDoer interface {
++	Do(req *http.Request) (*http.Response, error)
++}
++
++// inProcessDoer delivers internal HTTP requests straight into the server's
++// own router without touching a TCP listener.
++//
++// S3 event-notification deliveries to Lambda (async Invoke) and EventBridge
++// (PutEvents) use it so those targets stay reachable during graceful
++// shutdown: http.Server.Shutdown closes the network listener before the
++// notification drain begins, and a self-HTTP call would then fail with a
++// connection refusal. In-process dispatch keeps the exact handler-level
++// semantics (routing, status codes, payloads) while requiring no listener,
++// so target services remain available until the drain completes and their
++// own Close runs afterwards.
++type inProcessDoer struct {
++	handler http.Handler
++}
++
++// Do dispatches req through the embedded handler synchronously and converts
++// the recorded result into an *http.Response. The call runs inline, so the
++// request context — including the shutdown deadline — is honored end to
++// end and a canceled or expired context aborts the handler like a real
++// transport abort would.
++func (d *inProcessDoer) Do(req *http.Request) (*http.Response, error) {
++	// http.Handler.ServeHTTP requires RequestURI to be empty; requests
++	// built with http.NewRequest already satisfy that, and clearing it
++	// keeps the adapter safe for any caller.
++	req.RequestURI = ""
++
++	if req.Body == nil {
++		req.Body = http.NoBody
++	}
++
++	rec := httptest.NewRecorder()
++	d.handler.ServeHTTP(rec, req)
++
++	return rec.Result(), nil
++}
++
++// wireS3EventBridgeInProcess installs the in-process HTTP client on the S3
++// service so Object Created events reach EventBridge without a network
++// listener. It must run after the S3 service has been registered; without
++// an S3 service there is nothing to wire.
++func wireS3EventBridgeInProcess(registry *service.Registry, internal httpDoer) {
++	s3Svc, ok := registry.Get("s3")
++	if !ok {
++		return
++	}
++
++	s3Typed, ok := s3Svc.(*s3.Service)
++	if !ok {
++		return
++	}
++
++	s3Typed.SetEventBridgeClient(internal)
++}
+diff --git a/internal/server/internal_delivery_test.go b/internal/server/internal_delivery_test.go
+new file mode 100644
+index 0000000..3e9e8c3
+--- /dev/null
++++ b/internal/server/internal_delivery_test.go
+@@ -0,0 +1,121 @@
++package server
++
++import (
++	"context"
++	"io"
++	"log/slog"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++)
++
++func discardLogger() *slog.Logger {
++	return slog.New(slog.NewTextHandler(io.Discard, nil))
++}
++
++// TestInProcessDoer_DispatchesWithoutListener verifies the in-process
++// transport reaches the registered handler and preserves the status code and
++// body without any network listener — the property S3 notification delivery
++// to Lambda/EventBridge depends on during shutdown.
++func TestInProcessDoer_DispatchesWithoutListener(t *testing.T) {
++	t.Parallel()
++
++	router := NewRouter(discardLogger())
++	router.Handle("POST", "/internal-target", func(w http.ResponseWriter, r *http.Request) {
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Errorf("ReadAll: %v", err)
++		}
++
++		w.Header().Set("X-Kumo-Test", string(body))
++		w.WriteHeader(http.StatusAccepted)
++		_, _ = w.Write([]byte("accepted"))
++	})
++
++	doer := &inProcessDoer{handler: router}
++
++	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
++		"http://localhost/internal-target", strings.NewReader("payload"))
++	if err != nil {
++		t.Fatalf("NewRequest: %v", err)
++	}
++
++	resp, err := doer.Do(req)
++	if err != nil {
++		t.Fatalf("Do() error = %v, want nil", err)
++	}
++
++	defer func() { _ = resp.Body.Close() }()
++
++	if resp.StatusCode != http.StatusAccepted {
++		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
++	}
++
++	if got := resp.Header.Get("X-Kumo-Test"); got != "payload" {
++		t.Fatalf("handler saw body %q, want payload", got)
++	}
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("ReadAll: %v", err)
++	}
++
++	if string(body) != "accepted" {
++		t.Fatalf("response body = %q, want accepted", body)
++	}
++}
++
++// TestInProcessDoer_ContextCancelUnwindsHandler verifies a canceled request
++// context unblocks the in-flight handler and Do returns only after the
++// handler goroutine has exited — the no-leak guarantee the shutdown deadline
++// relies on.
++func TestInProcessDoer_ContextCancelUnwindsHandler(t *testing.T) {
++	t.Parallel()
++
++	handlerEntered := make(chan struct{})
++	handlerExited := make(chan struct{})
++
++	router := NewRouter(discardLogger())
++	router.Handle("POST", "/blocked", func(_ http.ResponseWriter, r *http.Request) {
++		close(handlerEntered)
++		<-r.Context().Done()
++		close(handlerExited)
++	})
++
++	doer := &inProcessDoer{handler: router}
++
++	ctx, cancel := context.WithCancel(context.Background())
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/blocked", http.NoBody)
++	if err != nil {
++		t.Fatalf("NewRequest: %v", err)
++	}
++
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++
++		resp, err := doer.Do(req)
++		if err == nil {
++			_ = resp.Body.Close()
++		}
++	}()
++
++	<-handlerEntered
++
++	cancel()
++
++	select {
++	case <-handlerExited:
++	case <-time.After(2 * time.Second):
++		t.Fatal("handler did not unwind after request context cancel")
++	}
++
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Do did not return after the handler unwound")
++	}
++}
+diff --git a/internal/server/s3_lambda_wiring_test.go b/internal/server/s3_lambda_wiring_test.go
+index 8a059de..330d256 100644
+--- a/internal/server/s3_lambda_wiring_test.go
++++ b/internal/server/s3_lambda_wiring_test.go
+@@ -54,8 +54,8 @@ func TestS3ToLambdaInvoker_InvokeAsync_StatusHandling(t *testing.T) {
+ 			// http.DefaultTransport: httptest's Close closes its idle
+ 			// connections, killing the sibling subtest's in-flight request.
+ 			inv := &s3ToLambdaInvoker{
+-				baseURL:    srv.URL,
+-				httpClient: &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}},
++				baseURL: srv.URL,
++				doer:    &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}},
+ 			}
+ 
+ 			err := inv.InvokeAsync(context.Background(), "arn:aws:lambda:us-east-1:123456789012:function:my-func", []byte(`{}`))
+diff --git a/internal/server/server.go b/internal/server/server.go
+index 6962c13..3d0a251 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -109,12 +109,19 @@ func New(config Config) *Server {
+ 		srv.RegisterService(svc)
+ 	}
+ 
++	// In-process transport for internal self-calls (S3 -> Lambda async
++	// Invoke, S3 -> EventBridge PutEvents). It keeps those targets
++	// reachable during shutdown even though the network listener is
++	// already closed.
++	internalDoer := &inProcessDoer{handler: router}
++
+ 	// Cross-service wiring (must happen after all services are registered).
+ 	wireSNStoSQS(registry)
+ 	wireS3toSQS(registry)
+-	wireS3toLambda(registry)
++	wireS3toLambda(registry, internalDoer)
+ 	wireS3toSNS(registry)
+ 	wireCloudWatchToSNS(registry)
++	wireS3EventBridgeInProcess(registry, internalDoer)
+ 
+ 	hasJSONServices := len(jsonDispatcher.handlers) > 0
+ 	hasQueryServices := len(queryDispatcher.handlers) > 0
+@@ -241,17 +248,39 @@ func (s *Server) Start(readyCh ...chan struct{}) error {
+ 	return nil
+ }
+ 
++// notificationDrainer is implemented by services that accept asynchronous
++// notification work from request handlers and need a bounded drain after
++// the HTTP listener stops (currently s3.Service). The drain must run while
++// every delivery target is still open, before the services are closed.
++type notificationDrainer interface {
++	ShutdownNotifications(ctx context.Context) error
++}
++
+ // Shutdown gracefully shuts down the server.
++//
++// The order is deliberate and must not depend on registry map iteration:
++//
++//  1. Stop accepting new HTTP requests and finish in-flight handlers.
++//     Object write handlers register their accepted ObjectCreated
++//     notifications synchronously before returning, so by the time this
++//     returns the whole batch is tracked.
++//  2. Drain those notifications while SQS, SNS, Lambda and EventBridge are
++//     all still available (in-process targets need no listener). A blocked
++//     delivery that finishes within ctx makes Shutdown succeed; when ctx
++//     expires the deliveries are canceled and the recognizable
++//     context.DeadlineExceeded is returned.
++//  3. Close the services for their final snapshots. All
++//     notification-induced state has settled, so close order is
++//     irrelevant and persistence cannot lose a late delivery.
+ func (s *Server) Shutdown(ctx context.Context) error {
+ 	s.logger.Info("shutting down server")
+ 
+-	// Drain in-flight requests first so no handler mutates state after we take
+-	// the final snapshot. Persistence is now debounced (see internal/storage), so
+-	// a mutation that lands after Close would otherwise be lost on exit.
+ 	if err := s.server.Shutdown(ctx); err != nil {
+ 		return fmt.Errorf("failed to shutdown server: %w", err)
+ 	}
+ 
++	drainErr := s.drainNotifications(ctx)
++
+ 	for _, svc := range s.registry.All() {
+ 		if c, ok := svc.(io.Closer); ok {
+ 			if err := c.Close(); err != nil {
+@@ -260,6 +289,29 @@ func (s *Server) Shutdown(ctx context.Context) error {
+ 		}
+ 	}
+ 
++	return drainErr
++}
++
++// drainNotifications runs the S3 service's accepted-notification drain with
++// the shutdown deadline. It is a no-op when S3 is absent or does not
++// implement draining.
++func (s *Server) drainNotifications(ctx context.Context) error {
++	s3Svc, ok := s.registry.Get("s3")
++	if !ok {
++		return nil
++	}
++
++	drainer, ok := s3Svc.(notificationDrainer)
++	if !ok {
++		return nil
++	}
++
++	if err := drainer.ShutdownNotifications(ctx); err != nil {
++		s.logger.Error("S3 event notification drain did not finish in time", "error", err)
++
++		return fmt.Errorf("drain S3 event notifications: %w", err)
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/internal/server/shutdown_drain_test.go b/internal/server/shutdown_drain_test.go
+new file mode 100644
+index 0000000..f824118
+--- /dev/null
++++ b/internal/server/shutdown_drain_test.go
+@@ -0,0 +1,411 @@
++package server
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sivchari/kumo/internal/service"
++	"github.com/sivchari/kumo/internal/service/eventbridge"
++	"github.com/sivchari/kumo/internal/service/lambda"
++	"github.com/sivchari/kumo/internal/service/s3"
++	"github.com/sivchari/kumo/internal/service/sns"
++	"github.com/sivchari/kumo/internal/service/sqs"
++)
++
++const drainTestBaseURL = "http://localhost:4566"
++
++// newIsolatedServer builds a Server with fresh, test-local instances of the
++// messaging services, so shutdown tests never touch the process-global
++// service singletons (and never double-close them across tests).
++func newIsolatedServer(t *testing.T) *Server {
++	t.Helper()
++
++	logger := discardLogger()
++	registry := service.NewRegistry()
++	router := NewRouter(logger)
++
++	srv := &Server{
++		config:          DefaultConfig(),
++		router:          router,
++		registry:        registry,
++		jsonDispatcher:  NewJSONProtocolDispatcher(),
++		queryDispatcher: NewQueryProtocolDispatcher(),
++		cborDispatcher:  NewCBORProtocolDispatcher(),
++		logger:          logger,
++	}
++
++	srv.RegisterService(sqs.New(sqs.NewMemoryStorage(drainTestBaseURL), drainTestBaseURL))
++	srv.RegisterService(sns.New(sns.NewMemoryStorage(drainTestBaseURL)))
++	srv.RegisterService(lambda.New(lambda.NewMemoryStorage(drainTestBaseURL), drainTestBaseURL))
++	srv.RegisterService(s3.New(s3.NewMemoryStorage(), drainTestBaseURL))
++
++	internal := &inProcessDoer{handler: router}
++
++	wireSNStoSQS(registry)
++	wireS3toSQS(registry)
++	wireS3toLambda(registry, internal)
++	wireS3toSNS(registry)
++	wireS3EventBridgeInProcess(registry, internal)
++
++	router.HandleFunc("POST", "/", srv.unifiedDispatcher)
++
++	return srv
++}
++
++func isolatedS3(t *testing.T, srv *Server) *s3.Service {
++	t.Helper()
++
++	svc, ok := srv.Registry().Get("s3")
++	if !ok {
++		t.Fatal("s3 service not registered")
++	}
++
++	s3svc, ok := svc.(*s3.Service)
++	if !ok {
++		t.Fatalf("s3 service has unexpected type %T", svc)
++	}
++
++	return s3svc
++}
++
++// drainGate is a blocking stand-in for every S3 notification target (SQS,
++// SNS, Lambda publishers and the EventBridge HTTP client). Deliveries park
++// on release and report cancellation, so a test can observe the full drain
++// lifecycle.
++type drainGate struct {
++	release      <-chan struct{}
++	started      chan string
++	canceled     chan string
++	doerStarted  chan struct{}
++	doerCanceled chan struct{}
++}
++
++func newDrainGate(release <-chan struct{}) *drainGate {
++	return &drainGate{
++		release:      release,
++		started:      make(chan string, 16),
++		canceled:     make(chan string, 16),
++		doerStarted:  make(chan struct{}, 16),
++		doerCanceled: make(chan struct{}, 16),
++	}
++}
++
++func (g *drainGate) install(s3svc *s3.Service) {
++	s3svc.SetSQSPublisher(g)
++	s3svc.SetSNSPublisher(g)
++	s3svc.SetLambdaInvoker(g)
++	s3svc.SetEventBridgeClient(g)
++}
++
++func (g *drainGate) wait(ctx context.Context, name string) error {
++	g.started <- name
++
++	select {
++	case <-g.release:
++		return nil
++	case <-ctx.Done():
++		g.canceled <- name
++
++		return fmt.Errorf("%s notification delivery canceled: %w", name, ctx.Err())
++	}
++}
++
++func (g *drainGate) PublishToSQS(ctx context.Context, _, _ string) error {
++	return g.wait(ctx, "sqs")
++}
++
++func (g *drainGate) Publish(ctx context.Context, _, _, _ string) error {
++	return g.wait(ctx, "sns")
++}
++
++func (g *drainGate) InvokeAsync(ctx context.Context, _ string, _ []byte) error {
++	return g.wait(ctx, "lambda")
++}
++
++func (g *drainGate) Do(req *http.Request) (*http.Response, error) {
++	g.doerStarted <- struct{}{}
++
++	select {
++	case <-g.release:
++		return &http.Response{
++			StatusCode: http.StatusOK,
++			Header:     make(http.Header),
++			Body:       io.NopCloser(bytes.NewReader(nil)),
++		}, nil
++	case <-req.Context().Done():
++		g.doerCanceled <- struct{}{}
++
++		return nil, fmt.Errorf("eventbridge notification delivery canceled: %w", req.Context().Err())
++	}
++}
++
++// configureDrainBucket creates a bucket with one suffix-filtered
++// configuration per publisher target and EventBridge enabled.
++func configureDrainBucket(t *testing.T, s3svc *s3.Service, bucket string) {
++	t.Helper()
++
++	store := s3svc.Storage()
++
++	if err := store.CreateBucket(context.Background(), bucket); err != nil {
++		t.Fatalf("CreateBucket: %v", err)
++	}
++
++	body := `<NotificationConfiguration>` +
++		`<QueueConfiguration><Id>q</Id><Queue>arn:aws:sqs:us-east-1:000000000000:drain</Queue>` +
++		`<Event>s3:ObjectCreated:*</Event>` +
++		`<Filter><S3Key><FilterRule><Name>suffix</Name><Value>.sqs</Value></FilterRule></S3Key></Filter>` +
++		`</QueueConfiguration>` +
++		`<TopicConfiguration><Id>n</Id><Topic>arn:aws:sns:us-east-1:000000000000:drain</Topic>` +
++		`<Event>s3:ObjectCreated:*</Event>` +
++		`<Filter><S3Key><FilterRule><Name>suffix</Name><Value>.sns</Value></FilterRule></S3Key></Filter>` +
++		`</TopicConfiguration>` +
++		`<CloudFunctionConfiguration><Id>l</Id><CloudFunction>arn:aws:lambda:us-east-1:00000000000:function:drain</CloudFunction>` +
++		`<Event>s3:ObjectCreated:*</Event>` +
++		`<Filter><S3Key><FilterRule><Name>suffix</Name><Value>.lambda</Value></FilterRule></S3Key></Filter>` +
++		`</CloudFunctionConfiguration>` +
++		`</NotificationConfiguration>`
++
++	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/"+bucket+"?notification", strings.NewReader(body))
++	req.SetPathValue("bucket", bucket)
++
++	rec := httptest.NewRecorder()
++	s3svc.PutBucketNotificationConfiguration(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("PutBucketNotificationConfiguration status: got %d, want %d (body=%s)", rec.Code, http.StatusOK, rec.Body.String())
++	}
++
++	store.SetEventBridgeNotification(context.Background(), bucket, true)
++}
++
++func putObjectThroughHandler(t *testing.T, s3svc *s3.Service, bucket, key string) {
++	t.Helper()
++
++	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/"+bucket+"/"+key, strings.NewReader("data"))
++	req.SetPathValue("bucket", bucket)
++	req.SetPathValue("key", key)
++
++	rec := httptest.NewRecorder()
++	s3svc.PutObject(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("PutObject(%s) status: got %d, want %d", key, rec.Code, http.StatusOK)
++	}
++}
++
++func waitGateStarted(t *testing.T, g *drainGate, want int) {
++	t.Helper()
++
++	started := make(map[string]bool)
++	deadline := time.After(2 * time.Second)
++
++	for len(started) < want {
++		select {
++		case name := <-g.started:
++			started[name] = true
++		case <-g.doerStarted:
++			started["eventbridge"] = true
++		case <-deadline:
++			t.Fatalf("only %d/%d targets started: %v", len(started), want, started)
++		}
++	}
++}
++
++// TestServerShutdown_DrainsAcceptedNotifications is the end-to-end version
++// of the drain contract: after the HTTP server stops, a blocked delivery
++// that recovers within the deadline keeps its targets available and
++// Shutdown waits for every accepted notification before closing services.
++func TestServerShutdown_DrainsAcceptedNotifications(t *testing.T) {
++	srv := newIsolatedServer(t)
++	s3svc := isolatedS3(t, srv)
++
++	const bucket = "server-drain-recovers"
++
++	release := make(chan struct{})
++	gate := newDrainGate(release)
++	gate.install(s3svc)
++
++	configureDrainBucket(t, s3svc, bucket)
++
++	// An http.Server that has never served: Shutdown returns nil at once,
++	// exercising only the drain + close ordering under test.
++	srv.server = &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: time.Second}
++
++	for _, key := range []string{"hit.sqs", "hit.sns", "hit.lambda"} {
++		putObjectThroughHandler(t, s3svc, bucket, key)
++	}
++
++	waitGateStarted(t, gate, 4)
++
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		close(release)
++	}()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	start := time.Now()
++
++	if err := srv.Shutdown(ctx); err != nil {
++		t.Fatalf("Shutdown() = %v, want nil after blocked targets recovered", err)
++	}
++
++	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
++		t.Fatalf("Shutdown returned after %v, want it to wait for the drain", elapsed)
++	}
++}
++
++// TestServerShutdown_DrainDeadlineReturnsDeadlineExceeded verifies the
++// deadline path through the real Server: the recognizable context error is
++// returned, in-flight deliveries are canceled, and services are still
++// closed afterwards.
++func TestServerShutdown_DrainDeadlineReturnsDeadlineExceeded(t *testing.T) {
++	srv := newIsolatedServer(t)
++	s3svc := isolatedS3(t, srv)
++
++	const bucket = "server-drain-deadline"
++
++	gate := newDrainGate(make(chan struct{})) // never released
++	gate.install(s3svc)
++
++	configureDrainBucket(t, s3svc, bucket)
++
++	srv.server = &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: time.Second}
++
++	for _, key := range []string{"hit.sqs", "hit.sns", "hit.lambda"} {
++		putObjectThroughHandler(t, s3svc, bucket, key)
++	}
++
++	waitGateStarted(t, gate, 4)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++	defer cancel()
++
++	err := srv.Shutdown(ctx)
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("Shutdown() = %v, want context.DeadlineExceeded", err)
++	}
++
++	canceled := make(map[string]bool)
++
++	for range 3 {
++		select {
++		case name := <-gate.canceled:
++			canceled[name] = true
++		case <-time.After(2 * time.Second):
++			t.Fatalf("only %v targets canceled, want all publishers", canceled)
++		}
++	}
++
++	for _, want := range []string{"sqs", "sns", "lambda"} {
++		if !canceled[want] {
++			t.Fatalf("canceled targets = %v, missing %q", canceled, want)
++		}
++	}
++
++	select {
++	case <-gate.doerCanceled:
++	case <-time.After(2 * time.Second):
++		t.Fatal("EventBridge delivery was not canceled")
++	}
++}
++
++// TestServerShutdown_EventBridgeStaysAvailableAfterListenerClosed verifies
++// the explicit requirement that EventBridge stays a usable target during the
++// drain even though no network listener exists: the S3 Object Created event
++// is delivered in-process into EventBridge, matches a rule, and is recorded
++// with its payload intact.
++func TestServerShutdown_EventBridgeStaysAvailableAfterListenerClosed(t *testing.T) {
++	srv := newIsolatedServer(t)
++
++	eventsStore := eventbridge.NewMemoryStorage(eventbridge.WithBaseURL(drainTestBaseURL))
++	eventsSvc := eventbridge.New(eventsStore)
++	srv.RegisterService(eventsSvc)
++
++	ctx := context.Background()
++
++	if _, err := eventsStore.PutRule(ctx, &eventbridge.PutRuleRequest{
++		Name:         "s3-object-created",
++		EventPattern: `{"source":["aws.s3"],"detail-type":["Object Created"]}`,
++	}); err != nil {
++		t.Fatalf("PutRule: %v", err)
++	}
++
++	// A Step Functions-style ARN is neither an SQS/Lambda ARN nor an API
++	// destination, so the rule records delivery without spawning external
++	// HTTP calls.
++	if _, err := eventsStore.PutTargets(ctx, "", "s3-object-created", []eventbridge.TargetInput{{
++		ID:  "states-target",
++		Arn: "arn:aws:states:us-east-1:000000000000:stateMachine:drain",
++	}}); err != nil {
++		t.Fatalf("PutTargets: %v", err)
++	}
++
++	s3svc := isolatedS3(t, srv)
++
++	const bucket = "server-drain-eventbridge"
++
++	if err := s3svc.Storage().CreateBucket(ctx, bucket); err != nil {
++		t.Fatalf("CreateBucket: %v", err)
++	}
++
++	s3svc.Storage().SetEventBridgeNotification(ctx, bucket, true)
++
++	srv.server = &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: time.Second}
++
++	putObjectThroughHandler(t, s3svc, bucket, "hello.txt")
++
++	drainCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++
++	if err := srv.Shutdown(drainCtx); err != nil {
++		t.Fatalf("Shutdown() = %v, want nil", err)
++	}
++
++	getReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/kumo/eventbridge/delivered-events", http.NoBody)
++	rec := httptest.NewRecorder()
++	srv.Handler().ServeHTTP(rec, getReq)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("GetDeliveredEvents status: got %d, want %d", rec.Code, http.StatusOK)
++	}
++
++	body := rec.Body.String()
++
++	for _, want := range []string{`"Source":"aws.s3"`, `"DetailType":"Object Created"`, bucket, "hello.txt"} {
++		if !strings.Contains(body, want) {
++			t.Fatalf("delivered events body missing %q:\n%s", want, body)
++		}
++	}
++}
++
++// TestS3ToLambdaInvoker_InProcessRouting verifies the in-process doer wired
++// into the Lambda adapter still surfaces handler-level status codes: a
++// missing function is a 404 from the Lambda route and therefore an error,
++// with no listener involved.
++func TestS3ToLambdaInvoker_InProcessRouting(t *testing.T) {
++	srv := newIsolatedServer(t)
++
++	inv := &s3ToLambdaInvoker{
++		baseURL: drainTestBaseURL,
++		doer:    &inProcessDoer{handler: srv.Handler()},
++	}
++
++	err := inv.InvokeAsync(context.Background(), "arn:aws:lambda:us-east-1:00000000000:function:missing", []byte(`{}`))
++	if err == nil {
++		t.Fatal("InvokeAsync() = nil, want an error for a missing function")
++	}
++
++	if !strings.Contains(err.Error(), "404") {
++		t.Fatalf("InvokeAsync() error = %q, want it to contain 404", err.Error())
++	}
++}
+diff --git a/internal/server/sns_sqs_wiring.go b/internal/server/sns_sqs_wiring.go
+index a2e960e..da05adb 100644
+--- a/internal/server/sns_sqs_wiring.go
++++ b/internal/server/sns_sqs_wiring.go
+@@ -7,7 +7,6 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/sivchari/kumo/internal/service"
+ 	"github.com/sivchari/kumo/internal/service/lambda"
+@@ -207,7 +206,7 @@ func (p *s3ToSQSPublisher) arnToQueueURL(arn string) string {
+ // Without this wiring, PutObject/CopyObject/CompleteMultipartUpload
+ // silently ignore LambdaFunctionConfiguration entries because
+ // s3.Service.lambdaInvoker is nil. The pattern mirrors wireS3toSQS.
+-func wireS3toLambda(registry *service.Registry) {
++func wireS3toLambda(registry *service.Registry, internal httpDoer) {
+ 	s3Svc, ok := registry.Get("s3")
+ 	if !ok {
+ 		return
+@@ -228,9 +227,11 @@ func wireS3toLambda(registry *service.Registry) {
+ 		return
+ 	}
+ 
++	// The in-process doer keeps the Lambda target reachable during
++	// shutdown after the network listener has closed.
+ 	s3Typed.SetLambdaInvoker(&s3ToLambdaInvoker{
+-		baseURL:    lambdaTyped.BaseURL(),
+-		httpClient: &http.Client{Timeout: 5 * time.Second},
++		baseURL: lambdaTyped.BaseURL(),
++		doer:    internal,
+ 	})
+ }
+ 
+@@ -238,10 +239,11 @@ func wireS3toLambda(registry *service.Registry) {
+ // the S3 LambdaInvoker interface. It POSTs the S3 event notification
+ // payload to the Lambda invoke endpoint with the async invocation-type
+ // header so the request rides Lambda's async dispatch queue instead of
+-// blocking for a response.
++// blocking for a response. The doer normally dispatches in-process via the
++// server router.
+ type s3ToLambdaInvoker struct {
+-	baseURL    string
+-	httpClient *http.Client
++	baseURL string
++	doer    httpDoer
+ }
+ 
+ // InvokeAsync invokes the Lambda function identified by functionArn,
+@@ -259,7 +261,7 @@ func (inv *s3ToLambdaInvoker) InvokeAsync(ctx context.Context, functionArn strin
+ 	req.Header.Set("Content-Type", "application/json")
+ 	req.Header.Set("X-Amz-Invocation-Type", "Event")
+ 
+-	resp, err := inv.httpClient.Do(req)
++	resp, err := inv.doer.Do(req)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to invoke Lambda function %s: %w", functionName, err)
+ 	}
+diff --git a/internal/service/s3/handlers.go b/internal/service/s3/handlers.go
+index 3507126..e61bd0b 100644
+--- a/internal/service/s3/handlers.go
++++ b/internal/service/s3/handlers.go
+@@ -794,13 +794,10 @@ func (s *Service) PutObject(w http.ResponseWriter, r *http.Request) {
+ 
+ 	w.WriteHeader(http.StatusOK)
+ 
+-	go s.emitObjectCreatedEvent(context.Background(), bucket, key, obj.Size, obj.ETag)
+-
+-	go s.emitSQSNotifications(context.Background(), bucket, key, eventObjectCreatedPut, obj.Size, obj.ETag)
+-
+-	go s.emitLambdaNotifications(context.Background(), bucket, key, eventObjectCreatedPut, obj.Size, obj.ETag)
+-
+-	go s.emitSNSNotifications(context.Background(), bucket, key, eventObjectCreatedPut, obj.Size, obj.ETag)
++	// Register the accepted ObjectCreated notifications before the handler
++	// returns, so the shutdown drain cannot miss the work this successful
++	// write just promised.
++	s.dispatchObjectCreatedNotifications(bucket, key, eventObjectCreatedPut, obj.Size, obj.ETag)
+ }
+ 
+ // CopyObject handles PUT /{bucket}/{key} with X-Amz-Copy-Source header.
+@@ -877,10 +874,10 @@ func (s *Service) CopyObject(w http.ResponseWriter, r *http.Request) {
+ 
+ 	writeXMLResponse(w, result)
+ 
+-	go s.emitObjectCreatedEvent(context.Background(), dstBucket, dstKey, dstObj.Size, dstObj.ETag)
+-	go s.emitSQSNotifications(context.Background(), dstBucket, dstKey, eventObjectCreatedCopy, dstObj.Size, dstObj.ETag)
+-	go s.emitLambdaNotifications(context.Background(), dstBucket, dstKey, eventObjectCreatedCopy, dstObj.Size, dstObj.ETag)
+-	go s.emitSNSNotifications(context.Background(), dstBucket, dstKey, eventObjectCreatedCopy, dstObj.Size, dstObj.ETag)
++	// Register the accepted ObjectCreated notifications before the handler
++	// returns, so the shutdown drain cannot miss the work this successful
++	// copy just promised.
++	s.dispatchObjectCreatedNotifications(dstBucket, dstKey, eventObjectCreatedCopy, dstObj.Size, dstObj.ETag)
+ }
+ 
+ // getCopySource retrieves the source object for a copy operation,
+@@ -2355,10 +2352,10 @@ func (s *Service) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
+ 
+ 	writeXMLResponse(w, result)
+ 
+-	go s.emitObjectCreatedEvent(context.Background(), bucket, key, obj.Size, obj.ETag)
+-	go s.emitSQSNotifications(context.Background(), bucket, key, eventObjectCreatedCMU, obj.Size, obj.ETag)
+-	go s.emitLambdaNotifications(context.Background(), bucket, key, eventObjectCreatedCMU, obj.Size, obj.ETag)
+-	go s.emitSNSNotifications(context.Background(), bucket, key, eventObjectCreatedCMU, obj.Size, obj.ETag)
++	// Register the accepted ObjectCreated notifications before the handler
++	// returns, so the shutdown drain cannot miss the work this completed
++	// multipart upload just promised.
++	s.dispatchObjectCreatedNotifications(bucket, key, eventObjectCreatedCMU, obj.Size, obj.ETag)
+ }
+ 
+ // AbortMultipartUpload handles DELETE /{bucket}/{key}?uploadId={uploadId} - abort a multipart upload.
+diff --git a/internal/service/s3/notification_shutdown_test.go b/internal/service/s3/notification_shutdown_test.go
+new file mode 100644
+index 0000000..7d442af
+--- /dev/null
++++ b/internal/service/s3/notification_shutdown_test.go
+@@ -0,0 +1,601 @@
++package s3
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"mime/multipart"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++const drainTestQueueARN = "arn:aws:sqs:us-east-1:000000000000:drain-queue"
++
++// gateNotifier is a controllable blocking stand-in for the SQS, SNS and
++// Lambda notification targets. Every delivery parks on release and reports
++// which lifecycle phase it reached, so tests can prove the drain waits for
++// blocked targets, cancels them on deadline, and observes their completion.
++type gateNotifier struct {
++	started   chan string
++	canceled  chan string
++	completed chan string
++	release   <-chan struct{}
++	fail      map[string]bool
++}
++
++func newGateNotifier(release <-chan struct{}) *gateNotifier {
++	return &gateNotifier{
++		started:   make(chan string, 16),
++		canceled:  make(chan string, 16),
++		completed: make(chan string, 16),
++		release:   release,
++		fail:      make(map[string]bool),
++	}
++}
++
++func (g *gateNotifier) wait(ctx context.Context, name string) error {
++	g.started <- name
++
++	select {
++	case <-g.release:
++	case <-ctx.Done():
++		g.canceled <- name
++
++		return fmt.Errorf("%s notification delivery canceled: %w", name, ctx.Err())
++	}
++
++	if g.fail[name] {
++		return errors.New(name + " forced delivery failure")
++	}
++
++	g.completed <- name
++
++	return nil
++}
++
++func (g *gateNotifier) PublishToSQS(ctx context.Context, _, _ string) error {
++	return g.wait(ctx, "sqs")
++}
++
++func (g *gateNotifier) Publish(ctx context.Context, _, _, _ string) error {
++	return g.wait(ctx, "sns")
++}
++
++func (g *gateNotifier) InvokeAsync(ctx context.Context, _ string, _ []byte) error {
++	return g.wait(ctx, "lambda")
++}
++
++// gateDoer is the controllable blocking stand-in for the EventBridge HTTP
++// target.
++type gateDoer struct {
++	started   chan struct{}
++	canceled  chan struct{}
++	completed chan struct{}
++	release   <-chan struct{}
++	fail      bool
++}
++
++func newGateDoer(release <-chan struct{}) *gateDoer {
++	return &gateDoer{
++		started:   make(chan struct{}, 16),
++		canceled:  make(chan struct{}, 16),
++		completed: make(chan struct{}, 16),
++		release:   release,
++	}
++}
++
++func (d *gateDoer) Do(req *http.Request) (*http.Response, error) {
++	d.started <- struct{}{}
++
++	select {
++	case <-d.release:
++	case <-req.Context().Done():
++		d.canceled <- struct{}{}
++
++		return nil, fmt.Errorf("eventbridge notification delivery canceled: %w", req.Context().Err())
++	}
++
++	if d.fail {
++		return nil, errors.New("eventbridge forced delivery failure")
++	}
++
++	d.completed <- struct{}{}
++
++	return &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     make(http.Header),
++		Body:       io.NopCloser(bytes.NewReader(nil)),
++	}, nil
++}
++
++// drainFixture bundles a fully wired S3 service with its blocking target
++// fakes for the shutdown tests.
++type drainFixture struct {
++	store    *MemoryStorage
++	svc      *Service
++	notifier *gateNotifier
++	doer     *gateDoer
++	release  chan struct{}
++}
++
++// newDrainFixture builds an S3 service with one configuration of every
++// target type matching s3:ObjectCreated:* plus EventBridge enabled, all
++// routed through controllable gate fakes.
++func newDrainFixture(t *testing.T, bucket string) *drainFixture {
++	t.Helper()
++
++	store := NewMemoryStorage()
++	svc := New(store, "")
++
++	if err := store.CreateBucket(context.Background(), bucket); err != nil {
++		t.Fatalf("CreateBucket: %v", err)
++	}
++
++	// Distinct suffix filters keep the three configurations unambiguous
++	// under the overlap validation (filterless same-event configs are
++	// rejected), so three differently-suffixed writes fan out to all
++	// three publisher targets.
++	body := `<NotificationConfiguration>` +
++		`<QueueConfiguration><Id>drain-q</Id><Queue>` + drainTestQueueARN + `</Queue>` +
++		`<Event>s3:ObjectCreated:*</Event>` +
++		`<Filter><S3Key><FilterRule><Name>suffix</Name><Value>.sqs</Value></FilterRule></S3Key></Filter>` +
++		`</QueueConfiguration>` +
++		`<TopicConfiguration><Id>drain-t</Id><Topic>` + testTopicArn + `</Topic>` +
++		`<Event>s3:ObjectCreated:*</Event>` +
++		`<Filter><S3Key><FilterRule><Name>suffix</Name><Value>.sns</Value></FilterRule></S3Key></Filter>` +
++		`</TopicConfiguration>` +
++		`<CloudFunctionConfiguration><Id>drain-l</Id><CloudFunction>` + testLambdaArn + `</CloudFunction>` +
++		`<Event>s3:ObjectCreated:*</Event>` +
++		`<Filter><S3Key><FilterRule><Name>suffix</Name><Value>.lambda</Value></FilterRule></S3Key></Filter>` +
++		`</CloudFunctionConfiguration>` +
++		`</NotificationConfiguration>`
++
++	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/"+bucket+"?notification", strings.NewReader(body))
++	req.SetPathValue("bucket", bucket)
++
++	w := httptest.NewRecorder()
++	svc.PutBucketNotificationConfiguration(w, req)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("PutBucketNotificationConfiguration status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
++	}
++
++	store.SetEventBridgeNotification(context.Background(), bucket, true)
++
++	release := make(chan struct{})
++	notifier := newGateNotifier(release)
++	doer := newGateDoer(release)
++
++	svc.SetSQSPublisher(notifier)
++	svc.SetSNSPublisher(notifier)
++	svc.SetLambdaInvoker(notifier)
++	svc.SetEventBridgeClient(doer)
++
++	return &drainFixture{
++		store:    store,
++		svc:      svc,
++		notifier: notifier,
++		doer:     doer,
++		release:  release,
++	}
++}
++
++// waitTargetsStarted waits until the expected number of target deliveries
++// (the three named publisher targets plus EventBridge) have parked.
++func waitTargetsStarted(t *testing.T, n *gateNotifier, d *gateDoer, want int) {
++	t.Helper()
++
++	deadline := time.After(2 * time.Second)
++	started := make(map[string]bool)
++
++	for len(started) < want {
++		select {
++		case name := <-n.started:
++			started[name] = true
++		case <-d.started:
++			started["eventbridge"] = true
++		case <-deadline:
++			t.Fatalf("only %d/%d targets started delivery: %v", len(started), want, started)
++		}
++	}
++}
++
++// putAllTargetTriggerObjects performs one successful PutObject per
++// publisher-target suffix so the SQS, SNS, Lambda targets each accept one
++// delivery (EventBridge accepts one per write).
++func putAllTargetTriggerObjects(t *testing.T, svc *Service, bucket string) {
++	t.Helper()
++
++	for _, key := range []string{"hit.sqs", "hit.sns", "hit.lambda"} {
++		w := httptest.NewRecorder()
++		svc.PutObject(w, putObjectRequest(t, bucket, key, "data"))
++
++		if w.Code != http.StatusOK {
++			t.Fatalf("PutObject(%s) status: got %d, want %d", key, w.Code, http.StatusOK)
++		}
++	}
++}
++
++// collectNames drains count signals from ch into a set.
++func collectNames(t *testing.T, ch <-chan string, count int) map[string]bool {
++	t.Helper()
++
++	got := make(map[string]bool)
++
++	for range count {
++		select {
++		case name := <-ch:
++			got[name] = true
++		case <-time.After(2 * time.Second):
++			t.Fatalf("only %v of %d signals received: %v", got, count, got)
++		}
++	}
++
++	return got
++}
++
++// TestShutdownNotifications_BlockedTargetsRecoverBeforeDeadline verifies the
++// core drain promise: deliveries parked when shutdown starts keep their
++// targets available, and when the block clears within the deadline the
++// drain waits for every delivery to finish and then returns nil.
++func TestShutdownNotifications_BlockedTargetsRecoverBeforeDeadline(t *testing.T) {
++	t.Parallel()
++
++	const bucket = "drain-recovers"
++
++	f := newDrainFixture(t, bucket)
++
++	putAllTargetTriggerObjects(t, f.svc, bucket)
++
++	waitTargetsStarted(t, f.notifier, f.doer, 4)
++
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		close(f.release)
++	}()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	start := time.Now()
++
++	if err := f.svc.ShutdownNotifications(ctx); err != nil {
++		t.Fatalf("ShutdownNotifications() = %v, want nil after targets recovered", err)
++	}
++
++	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
++		t.Fatalf("drain returned after %v, want it to wait for the blocked targets to recover", elapsed)
++	}
++
++	completed := collectNames(t, f.notifier.completed, 3)
++
++	for _, want := range []string{"sqs", "sns", "lambda"} {
++		if !completed[want] {
++			t.Fatalf("completed targets = %v, missing %q", completed, want)
++		}
++	}
++
++	select {
++	case <-f.doer.completed:
++	case <-time.After(2 * time.Second):
++		t.Fatal("EventBridge target did not complete")
++	}
++}
++
++// TestShutdownNotifications_DeadlineCancelsAndSettlesOnce verifies that an
++// expired shutdown deadline cancels the in-flight deliveries, returns the
++// recognizable context.DeadlineExceeded, waits for the goroutines to exit
++// (no leak), and that a repeated shutdown reports the same settled result
++// instead of settling the batch a second time.
++func TestShutdownNotifications_DeadlineCancelsAndSettlesOnce(t *testing.T) {
++	t.Parallel()
++
++	const bucket = "drain-deadline"
++
++	f := newDrainFixture(t, bucket)
++
++	putAllTargetTriggerObjects(t, f.svc, bucket)
++
++	waitTargetsStarted(t, f.notifier, f.doer, 4)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
++	defer cancel()
++
++	err := f.svc.ShutdownNotifications(ctx)
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("ShutdownNotifications() = %v, want context.DeadlineExceeded", err)
++	}
++
++	// Every blocked delivery must observe cancellation, proving its
++	// goroutine unwound instead of outliving the server.
++	canceled := collectNames(t, f.notifier.canceled, 3)
++
++	for _, want := range []string{"sqs", "sns", "lambda"} {
++		if !canceled[want] {
++			t.Fatalf("canceled targets = %v, missing %q", canceled, want)
++		}
++	}
++
++	select {
++	case <-f.doer.canceled:
++	case <-time.After(2 * time.Second):
++		t.Fatal("EventBridge target was not canceled")
++	}
++
++	// Repeated shutdown must not re-settle: it returns the same stored
++	// result immediately, regardless of the new caller's context.
++	start := time.Now()
++
++	err = f.svc.ShutdownNotifications(context.Background())
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("repeated ShutdownNotifications() = %v, want same context.DeadlineExceeded", err)
++	}
++
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("repeated ShutdownNotifications took %v, want the already-settled result", elapsed)
++	}
++}
++
++// TestShutdownNotifications_ConcurrentCallsSettleOnce verifies that
++// concurrent shutdown callers all observe a single successful settlement.
++func TestShutdownNotifications_ConcurrentCallsSettleOnce(t *testing.T) {
++	t.Parallel()
++
++	const bucket = "drain-concurrent"
++
++	f := newDrainFixture(t, bucket)
++	close(f.release) // targets never block
++
++	putAllTargetTriggerObjects(t, f.svc, bucket)
++
++	const callers = 6
++
++	var wg sync.WaitGroup
++
++	errs := make(chan error, callers)
++
++	for range callers {
++		wg.Add(1)
++
++		go func() {
++			defer wg.Done()
++
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++
++			errs <- f.svc.ShutdownNotifications(ctx)
++		}()
++	}
++
++	wg.Wait()
++	close(errs)
++
++	for err := range errs {
++		if err != nil {
++			t.Fatalf("concurrent ShutdownNotifications() = %v, want nil", err)
++		}
++	}
++
++	if err := f.svc.ShutdownNotifications(context.Background()); err != nil {
++		t.Fatalf("repeated ShutdownNotifications() = %v, want nil", err)
++	}
++}
++
++// TestShutdownNotifications_TargetFailureDoesNotCancelOthers verifies that a
++// single target failing neither cancels the other targets nor turns the
++// drain (or the already-returned object write) into a failure.
++func TestShutdownNotifications_TargetFailureDoesNotCancelOthers(t *testing.T) {
++	t.Parallel()
++
++	const bucket = "drain-target-failure"
++
++	f := newDrainFixture(t, bucket)
++	f.notifier.fail["sqs"] = true
++
++	putAllTargetTriggerObjects(t, f.svc, bucket)
++
++	waitTargetsStarted(t, f.notifier, f.doer, 4)
++	close(f.release)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	if err := f.svc.ShutdownNotifications(ctx); err != nil {
++		t.Fatalf("ShutdownNotifications() = %v, want nil despite SQS failure", err)
++	}
++
++	completed := collectNames(t, f.notifier.completed, 2)
++	if !completed["sns"] || !completed["lambda"] {
++		t.Fatalf("completed targets = %v, want both sns and lambda unaffected by the SQS failure", completed)
++	}
++
++	select {
++	case <-f.doer.completed:
++	case <-time.After(2 * time.Second):
++		t.Fatal("EventBridge target did not complete after a sibling target failed")
++	}
++}
++
++// TestShutdownNotifications_FailedObjectWriteProducesNoWork verifies the
++// existing "no event on write failure" contract also means there is nothing
++// to drain: the drain returns immediately and no target is ever contacted.
++func TestShutdownNotifications_FailedObjectWriteProducesNoWork(t *testing.T) {
++	t.Parallel()
++
++	f := newDrainFixture(t, "drain-configured-bucket")
++	close(f.release)
++
++	w := httptest.NewRecorder()
++	f.svc.PutObject(w, putObjectRequest(t, "drain-no-such-bucket", "hello.txt", "hello world"))
++
++	if w.Code == http.StatusOK {
++		t.Fatal("PutObject status = 200, want a failure for a missing bucket")
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	if err := f.svc.ShutdownNotifications(ctx); err != nil {
++		t.Fatalf("ShutdownNotifications() = %v, want nil with no accepted work", err)
++	}
++
++	select {
++	case <-f.notifier.started:
++		t.Fatal("unexpected delivery start after a failed object write")
++	case <-f.doer.started:
++		t.Fatal("unexpected EventBridge delivery start after a failed object write")
++	case <-time.After(150 * time.Millisecond):
++	}
++}
++
++// objectWriteFunc performs one of the four object-write operations against
++// the given bucket, producing the key "hit.sqs" so the SQS suffix filter and
++// EventBridge each accept a notification.
++type objectWriteFunc func(t *testing.T, bucket string, store *MemoryStorage, svc *Service)
++
++func performPutObject(t *testing.T, bucket string, _ *MemoryStorage, svc *Service) {
++	t.Helper()
++
++	w := httptest.NewRecorder()
++	svc.PutObject(w, putObjectRequest(t, bucket, "hit.sqs", "data"))
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("PutObject status: got %d, want %d", w.Code, http.StatusOK)
++	}
++}
++
++func performCopyObject(t *testing.T, bucket string, store *MemoryStorage, svc *Service) {
++	t.Helper()
++
++	if _, err := store.PutObject(context.Background(), bucket, "src.txt", strings.NewReader("data"), nil); err != nil {
++		t.Fatalf("seed PutObject: %v", err)
++	}
++
++	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/"+bucket+"/hit.sqs", http.NoBody)
++	req.SetPathValue("bucket", bucket)
++	req.SetPathValue("key", "hit.sqs")
++	req.Header.Set("X-Amz-Copy-Source", "/"+bucket+"/src.txt")
++
++	w := httptest.NewRecorder()
++	svc.CopyObject(w, req)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("CopyObject status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
++	}
++}
++
++func performPostObject(t *testing.T, bucket string, _ *MemoryStorage, svc *Service) {
++	t.Helper()
++
++	var body bytes.Buffer
++	mw := multipart.NewWriter(&body)
++
++	if err := mw.WriteField("key", "hit.sqs"); err != nil {
++		t.Fatalf("WriteField: %v", err)
++	}
++
++	fw, err := mw.CreateFormFile("file", "hit.sqs")
++	if err != nil {
++		t.Fatalf("CreateFormFile: %v", err)
++	}
++
++	if _, err := io.WriteString(fw, "data"); err != nil {
++		t.Fatalf("write file field: %v", err)
++	}
++
++	if err := mw.Close(); err != nil {
++		t.Fatalf("multipart close: %v", err)
++	}
++
++	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/"+bucket, &body)
++	req.Header.Set("Content-Type", mw.FormDataContentType())
++	req.SetPathValue("bucket", bucket)
++
++	w := httptest.NewRecorder()
++	svc.PostObject(w, req)
++
++	if w.Code != http.StatusNoContent && w.Code != http.StatusOK && w.Code != http.StatusCreated {
++		t.Fatalf("PostObject status: got %d, want a success status", w.Code)
++	}
++}
++
++func performCompleteMultipartUpload(t *testing.T, bucket string, store *MemoryStorage, svc *Service) {
++	t.Helper()
++
++	ctx := context.Background()
++
++	upload, err := store.CreateMultipartUpload(ctx, bucket, "hit.sqs", nil)
++	if err != nil {
++		t.Fatalf("CreateMultipartUpload: %v", err)
++	}
++
++	part, err := store.UploadPart(ctx, bucket, "hit.sqs", upload.UploadID, 1, strings.NewReader("all the bytes"))
++	if err != nil {
++		t.Fatalf("UploadPart: %v", err)
++	}
++
++	completeBody := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>` + part.ETag + `</ETag></Part></CompleteMultipartUpload>`
++
++	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/"+bucket+"/hit.sqs?uploadId="+upload.UploadID, strings.NewReader(completeBody))
++	req.SetPathValue("bucket", bucket)
++	req.SetPathValue("key", "hit.sqs")
++
++	w := httptest.NewRecorder()
++	svc.CompleteMultipartUpload(w, req)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("CompleteMultipartUpload status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
++	}
++}
++
++// TestShutdownNotifications_TracksEveryObjectWriteOperation verifies that
++// the four object-write operations the requirement names (PutObject,
++// CopyObject, POST Object, CompleteMultipartUpload) all register their
++// accepted notifications with the drain.
++func TestShutdownNotifications_TracksEveryObjectWriteOperation(t *testing.T) {
++	t.Parallel()
++
++	const bucket = "drain-all-operations"
++
++	operations := []struct {
++		name    string
++		perform objectWriteFunc
++	}{
++		{name: "PutObject", perform: performPutObject},
++		{name: "CopyObject", perform: performCopyObject},
++		{name: "PostObject", perform: performPostObject},
++		{name: "CompleteMultipartUpload", perform: performCompleteMultipartUpload},
++	}
++
++	for _, tt := range operations {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++
++			opBucket := bucket + "-" + strings.ToLower(strings.ReplaceAll(tt.name, "Object", ""))
++			f := newDrainFixture(t, opBucket)
++
++			tt.perform(t, opBucket, f.store, f.svc)
++
++			// One SQS delivery plus one EventBridge delivery must park.
++			waitTargetsStarted(t, f.notifier, f.doer, 2)
++
++			go func() {
++				time.Sleep(50 * time.Millisecond)
++				close(f.release)
++			}()
++
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++
++			if err := f.svc.ShutdownNotifications(ctx); err != nil {
++				t.Fatalf("ShutdownNotifications() = %v, want nil", err)
++			}
++		})
++	}
++}
+diff --git a/internal/service/s3/notify.go b/internal/service/s3/notify.go
+new file mode 100644
+index 0000000..2b59cd4
+--- /dev/null
++++ b/internal/service/s3/notify.go
+@@ -0,0 +1,118 @@
++package s3
++
++import (
++	"context"
++	"fmt"
++	"sync"
++)
++
++// notificationTracker tracks the event-notification deliveries that S3
++// accepts together with a successful object write (PutObject, CopyObject,
++// POST Object and CompleteMultipartUpload).
++//
++// During normal operation deliveries remain detached and asynchronous,
++// preserving the fire-and-forget behavior clients expect. Shutdown drains
++// the outstanding set so a SIGTERM landing immediately after a write
++// returned success does not strand the SQS, SNS, Lambda and EventBridge
++// notifications that write promised.
++type notificationTracker struct {
++	// wg counts deliveries in flight. goNotify increments it synchronously
++	// in the calling HTTP handler, so every delivery a successful response
++	// promised is registered before the handler returns and
++	// http.Server.Shutdown's in-flight handler wait completes.
++	wg sync.WaitGroup
++
++	// root is the parent context of every tracked delivery. It is
++	// uncanceled during normal operation (deliveries behave as they did
++	// with context.Background) and is canceled when a drain deadline
++	// expires, aborting calls that are still in flight.
++	root   context.Context
++	cancel context.CancelFunc
++
++	// once/settled/result make draining a single-flight: concurrent and
++	// repeated Shutdown calls observe one settlement of the same batch of
++	// work. result is written before settled is closed.
++	once    sync.Once
++	settled chan struct{}
++	result  error
++}
++
++func newNotificationTracker() *notificationTracker {
++	ctx, cancel := context.WithCancel(context.Background())
++
++	return &notificationTracker{
++		root:    ctx,
++		cancel:  cancel,
++		settled: make(chan struct{}),
++	}
++}
++
++// goNotify runs fn in a goroutine counted as in-flight notification work.
++// The WaitGroup counter is incremented synchronously before the goroutine
++// is scheduled, so no accepted delivery can escape a subsequent drain.
++func (t *notificationTracker) goNotify(fn func(ctx context.Context)) {
++	t.wg.Add(1)
++
++	go func() {
++		defer t.wg.Done()
++
++		fn(t.root)
++	}()
++}
++
++// Shutdown waits for every accepted notification delivery to reach a
++// terminal state (success or failure). It is safe for concurrent and
++// repeated use: the first call settles the outstanding batch once and
++// every caller observes the same stored result.
++//
++// If a temporarily blocked target recovers and its delivery finishes
++// before ctx expires, Shutdown waits for it and returns nil. If ctx
++// expires first, in-flight deliveries are canceled through their context
++// and Shutdown waits for their goroutines to exit before returning an
++// error that wraps context.DeadlineExceeded (recognizable via errors.Is),
++// so no notification goroutine outlives the server. A caller whose own
++// ctx expires while a settlement started by another caller is still
++// running receives a wrap of its own ctx.Err() without triggering a
++// second settlement.
++func (t *notificationTracker) Shutdown(ctx context.Context) error {
++	t.once.Do(func() {
++		go t.settle(ctx)
++	})
++
++	select {
++	case <-t.settled:
++		return t.result
++	case <-ctx.Done():
++		return fmt.Errorf("s3 notification drain: %w", ctx.Err())
++	}
++}
++
++// settle runs once under t.once. It waits for the tracked deliveries and,
++// on deadline, cancels them before waiting again so cancellation cannot
++// leak goroutines.
++func (t *notificationTracker) settle(ctx context.Context) {
++	completed := make(chan struct{})
++
++	go func() {
++		t.wg.Wait()
++		close(completed)
++	}()
++
++	select {
++	case <-completed:
++		t.result = nil
++	case <-ctx.Done():
++		// Cancel every delivery still in flight, then wait for the
++		// goroutines to actually observe it and exit. The %w wrap keeps
++		// errors.Is(err, context.DeadlineExceeded) true for callers that
++		// need to recognize the timeout.
++		t.cancel()
++		t.wg.Wait()
++		t.result = fmt.Errorf("s3 notification drain: %w", ctx.Err())
++	}
++
++	// Releases the root context on the all-delivered path as well; cancel
++	// is a no-op for deliveries already gone and is safe to call twice.
++	t.cancel()
++	close(t.settled)
++}
+diff --git a/internal/service/s3/object_post.go b/internal/service/s3/object_post.go
+index d1e569e..dfa3418 100644
+--- a/internal/service/s3/object_post.go
++++ b/internal/service/s3/object_post.go
+@@ -94,9 +94,18 @@ func (s *Service) PostObject(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("x-amz-version-id", obj.VersionID)
+ 	}
+ 
+-	go s.emitObjectCreatedEvent(context.Background(), bucket, upload.key, obj.Size, obj.ETag)
+-	go s.emitSQSNotifications(context.Background(), bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
+-	go s.emitLambdaNotifications(context.Background(), bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
++	// Tracked deliveries for the work this successful POST accepted. POST
++	// Object historically emits EventBridge, SQS and Lambda only (no SNS
++	// TopicConfiguration), so the three existing targets are preserved.
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitObjectCreatedEvent(ctx, bucket, upload.key, obj.Size, obj.ETag)
++	})
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitSQSNotifications(ctx, bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
++	})
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitLambdaNotifications(ctx, bucket, upload.key, "s3:ObjectCreated:Post", obj.Size, obj.ETag)
++	})
+ 
+ 	writePostObjectResponse(w, r, bucket, upload.key, obj)
+ }
+diff --git a/internal/service/s3/service.go b/internal/service/s3/service.go
+index d1d275d..d1f9b2a 100644
+--- a/internal/service/s3/service.go
++++ b/internal/service/s3/service.go
+@@ -73,14 +73,18 @@ type Service struct {
+ 	sqsPublisher  SQSPublisher
+ 	lambdaInvoker LambdaInvoker
+ 	snsPublisher  SNSPublisher
++	notifications *notificationTracker
++	eventClient   HTTPDoer
+ }
+ 
+ // New creates a new S3 service.
+ func New(storage Storage, baseURL string) *Service {
+ 	return &Service{
+-		storage: storage,
+-		baseURL: baseURL,
+-		logger:  slog.New(slog.NewTextHandler(os.Stdout, nil)),
++		storage:       storage,
++		baseURL:       baseURL,
++		logger:        slog.New(slog.NewTextHandler(os.Stdout, nil)),
++		notifications: newNotificationTracker(),
++		eventClient:   &http.Client{Timeout: 5 * time.Second},
+ 	}
+ }
+ 
+@@ -152,6 +156,50 @@ func (s *Service) SetSNSPublisher(p SNSPublisher) {
+ 	s.snsPublisher = p
+ }
+ 
++// HTTPDoer executes an HTTP request. *http.Client satisfies it; the server
++// wiring substitutes an in-process implementation so EventBridge delivery
++// stays reachable during shutdown, after the network listener has closed.
++type HTTPDoer interface {
++	Do(req *http.Request) (*http.Response, error)
++}
++
++// SetEventBridgeClient installs the client used to deliver Object Created
++// events to the internal EventBridge endpoint. Called by the server wiring
++// layer after all services have been registered.
++func (s *Service) SetEventBridgeClient(c HTTPDoer) {
++	s.eventClient = c
++}
++
++// ShutdownNotifications drains event-notification deliveries accepted by
++// successful object writes. It must be called after the HTTP server has
++// stopped accepting new requests and while the SQS, SNS, Lambda and
++// EventBridge targets are still available. It is idempotent and safe for
++// concurrent use; it returns context.DeadlineExceeded (recognizable via
++// errors.Is) when ctx expires before every delivery finishes.
++func (s *Service) ShutdownNotifications(ctx context.Context) error {
++	return s.notifications.Shutdown(ctx)
++}
++
++// dispatchObjectCreatedNotifications fans a single accepted ObjectCreated
++// write out to every notification target type. Each target type runs in
++// its own tracked goroutine, so one slow or failing target can neither
++// block nor cancel the others; delivery failures are logged and never
++// alter the object write's already-returned success result.
++func (s *Service) dispatchObjectCreatedNotifications(bucket, key, eventName string, size int64, etag string) {
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitObjectCreatedEvent(ctx, bucket, key, size, etag)
++	})
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitSQSNotifications(ctx, bucket, key, eventName, size, etag)
++	})
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitLambdaNotifications(ctx, bucket, key, eventName, size, etag)
++	})
++	s.notifications.goNotify(func(ctx context.Context) {
++		s.emitSNSNotifications(ctx, bucket, key, eventName, size, etag)
++	})
++}
++
+ // buildEventNotification constructs the S3 event notification message
+ // body shared by every notification destination (SQS, Lambda, ...).
+ func buildEventNotification(bucket, key, eventName string, size int64, etag, configID string) EventNotification {
+@@ -382,7 +430,7 @@ func (s *Service) putEvents(ctx context.Context, body []byte, bucket, key string
+ 	req.Header.Set("Content-Type", "application/x-amz-json-1.1")
+ 	req.Header.Set("X-Amz-Target", "AWSEvents.PutEvents")
+ 
+-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
++	resp, err := s.eventClient.Do(req)
+ 	if err != nil {
+ 		s.logger.Error("failed to emit S3 event to EventBridge", "error", err)
+ 

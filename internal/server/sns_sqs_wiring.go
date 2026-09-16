@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/sivchari/kumo/internal/service"
 	"github.com/sivchari/kumo/internal/service/lambda"
@@ -207,7 +206,7 @@ func (p *s3ToSQSPublisher) arnToQueueURL(arn string) string {
 // Without this wiring, PutObject/CopyObject/CompleteMultipartUpload
 // silently ignore LambdaFunctionConfiguration entries because
 // s3.Service.lambdaInvoker is nil. The pattern mirrors wireS3toSQS.
-func wireS3toLambda(registry *service.Registry) {
+func wireS3toLambda(registry *service.Registry, internal httpDoer) {
 	s3Svc, ok := registry.Get("s3")
 	if !ok {
 		return
@@ -228,9 +227,11 @@ func wireS3toLambda(registry *service.Registry) {
 		return
 	}
 
+	// The in-process doer keeps the Lambda target reachable during
+	// shutdown after the network listener has closed.
 	s3Typed.SetLambdaInvoker(&s3ToLambdaInvoker{
-		baseURL:    lambdaTyped.BaseURL(),
-		httpClient: &http.Client{Timeout: 5 * time.Second},
+		baseURL: lambdaTyped.BaseURL(),
+		doer:    internal,
 	})
 }
 
@@ -238,10 +239,11 @@ func wireS3toLambda(registry *service.Registry) {
 // the S3 LambdaInvoker interface. It POSTs the S3 event notification
 // payload to the Lambda invoke endpoint with the async invocation-type
 // header so the request rides Lambda's async dispatch queue instead of
-// blocking for a response.
+// blocking for a response. The doer normally dispatches in-process via the
+// server router.
 type s3ToLambdaInvoker struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL string
+	doer    httpDoer
 }
 
 // InvokeAsync invokes the Lambda function identified by functionArn,
@@ -259,7 +261,7 @@ func (inv *s3ToLambdaInvoker) InvokeAsync(ctx context.Context, functionArn strin
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Amz-Invocation-Type", "Event")
 
-	resp, err := inv.httpClient.Do(req)
+	resp, err := inv.doer.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to invoke Lambda function %s: %w", functionName, err)
 	}
